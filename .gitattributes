@@ -1,0 +1,4 @@
+# 行尾规范：文本文件统一 LF，Windows 批处理检出时保持 CRLF
+* text=auto
+*.cmd text eol=crlf
+*.bat text eol=crlf
