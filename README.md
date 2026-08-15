@@ -46,7 +46,7 @@ presets/minimal-bash/         Git Bash 版极简模式预设（复制到 DSH 预
 
 ---
 
-## 安装部署（从零到能用）
+## 安装部署
 
 ### 0. 前置条件
 
