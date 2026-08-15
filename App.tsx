@@ -5,6 +5,8 @@ import {
   FlatList,
   Keyboard,
   Modal,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   Platform,
   ScrollView,
   Share,
@@ -16,12 +18,14 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import Svg, { Path } from 'react-native-svg';
 import { pick, keepLocalCopy, types, isErrorWithCode, errorCodes } from '@react-native-documents/picker';
 import { CachesDirectoryPath, readFile as fsReadFile, writeFile as fsWriteFile } from '@dr.pogodin/react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DshClient } from './src/dsh/client';
 import type {
   AgentPresetEntry,
+  HistoryEntry,
   HostFrame,
   MuxFrame,
   SessionModelsValue,
@@ -39,7 +43,7 @@ interface ImageRef {
 }
 
 type ChatItem =
-  | { kind: 'msg'; id: string; role: 'user' | 'assistant'; text: string; streaming?: boolean; images?: ImageRef[] }
+  | { kind: 'msg'; id: string; role: 'user' | 'assistant'; text: string; reasoning?: string; streaming?: boolean; images?: ImageRef[] }
   | { kind: 'tool'; id: string; name: string; args: string; result?: string; isError?: boolean; done: boolean };
 
 interface PendingApproval {
@@ -65,6 +69,15 @@ function extractImageRefs(content: any): ImageRef[] {
     .map((b: any) => ({ attachmentId: b.attachmentId, mediaType: b.mediaType || 'image/png' }));
 }
 
+// 思维链（reasoning）文本：assistant/message 的 content 中 type === 'reasoning' 的块
+function extractReasoning(content: any): string {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((b: any) => b?.type === 'reasoning' && typeof b.text === 'string')
+    .map((b: any) => b.text)
+    .join('\n');
+}
+
 function extractToolResult(data: any): { text: string; isError: boolean } {
   const content = data?.message?.content;
   let text = '';
@@ -79,11 +92,10 @@ function extractToolResult(data: any): { text: string; isError: boolean } {
   return { text, isError };
 }
 
-async function loadHistory(client: DshClient, sessionId: string): Promise<{ items: ChatItem[]; tokenUsage: any | null }> {
-  const r = await client.history(sessionId);
-  if (!r.ok) return { items: [], tokenUsage: null };
+// 把一页历史事件解析成聊天条目（顺序不变，升序）
+function parseHistoryEvents(events: HistoryEntry[]): ChatItem[] {
   const out: ChatItem[] = [];
-  for (const entry of r.value.events) {
+  for (const entry of events) {
     const ev = entry.event;
     if (ev.type === 'user/message') {
       const content = ev.data?.content ?? ev.data?.message?.content;
@@ -93,8 +105,9 @@ async function loadHistory(client: DshClient, sessionId: string): Promise<{ item
     } else if (ev.type === 'assistant/message') {
       const content = ev.data?.message?.content;
       const text = extractText(content);
+      const reasoning = extractReasoning(content);
       const images = extractImageRefs(content);
-      if (text || images.length) out.push({ kind: 'msg', id: `a-${ev.seq}`, role: 'assistant', text, images: images.length ? images : undefined });
+      if (text || reasoning || images.length) out.push({ kind: 'msg', id: `a-${ev.seq}`, role: 'assistant', text, reasoning: reasoning || undefined, images: images.length ? images : undefined });
     } else if (ev.type === 'tool/call') {
       const d = ev.data;
       out.push({ kind: 'tool', id: `t-${d.callId}`, name: d.name, args: d.arguments ?? '', done: false });
@@ -113,8 +126,22 @@ async function loadHistory(client: DshClient, sessionId: string): Promise<{ item
       }
     }
   }
+  return out;
+}
+
+// 一页事件里的最小 seq（作为下一页 beforeSeq 的游标）
+function minEventSeq(events: HistoryEntry[]): number | undefined {
+  let min = Infinity;
+  for (const e of events) if (e.event.seq < min) min = e.event.seq;
+  return min === Infinity ? undefined : min;
+}
+
+async function loadHistory(client: DshClient, sessionId: string): Promise<{ items: ChatItem[]; tokenUsage: any | null; hasMore: boolean; oldestSeq: number | undefined }> {
+  const r = await client.history(sessionId);
+  if (!r.ok) return { items: [], tokenUsage: null, hasMore: false, oldestSeq: undefined };
+  const items = parseHistoryEvents(r.value.events);
   const tokenUsage = (r.value as any)?.projections?.values?.tokenUsage ?? null;
-  return { items: out, tokenUsage };
+  return { items, tokenUsage, hasMore: r.value.hasMore, oldestSeq: minEventSeq(r.value.events) };
 }
 
 function sessionTitle(s: SessionSummary): string {
@@ -165,6 +192,18 @@ async function downloadFile(baseUrl: string, hostPath: string): Promise<{ name: 
   return res.json();
 }
 
+// 纯黑色回形针矢量图标（Material Design attach_file 路径）
+function PaperclipIcon({ size = 22, color = '#000' }: { size?: number; color?: string }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24">
+      <Path
+        d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"
+        fill={color}
+      />
+    </Svg>
+  );
+}
+
 export default function App() {
   // 连接
   const [serverUrl, setServerUrl] = useState(DEFAULT_BASE_URL);
@@ -190,6 +229,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [tokenUsage, setTokenUsage] = useState<{ uncachedInputTokens: number; outputTokens: number; cacheReadTokens: number } | null>(null);
   const [kbHeight, setKbHeight] = useState(0);
+  const [reasoningOpen, setReasoningOpen] = useState<Record<string, boolean>>({});
+  const [loadingOlder, setLoadingOlder] = useState(false);
 
   // UI
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -204,13 +245,19 @@ export default function App() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [downloadPath, setDownloadPath] = useState('');
+  const [modeOpen, setModeOpen] = useState(false);
 
   const clientRef = useRef<DshClient | null>(null);
   const sessionRef = useRef<string | null>(null);
   const streamRef = useRef<{ id: string } | null>(null);
   const stopRef = useRef<(() => void) | null>(null);
   const listRef = useRef<FlatList<ChatItem>>(null);
+  const isAtBottomRef = useRef(true);
   const restoreSessionRef = useRef<string | null>(null);
+  // 历史分页游标
+  const historyHasMoreRef = useRef(false);
+  const historyOldestSeqRef = useRef<number | undefined>(undefined);
+  const loadingOlderRef = useRef(false);
 
   // 载入持久化设置
   useEffect(() => {
@@ -281,25 +328,32 @@ export default function App() {
 
       if (ev.type === 'assistant/chunk') {
         const chunk = ev.data?.chunk;
-        if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
+        const ensureStream = () => {
           if (!streamRef.current) {
             const id = `a-${ev.seq}`;
             streamRef.current = { id };
-            setItems((prev) => [...prev, { kind: 'msg', id, role: 'assistant', text: '', streaming: true }]);
+            setItems((prev) => [...prev, { kind: 'msg', id, role: 'assistant', text: '', reasoning: '', streaming: true }]);
           }
-          const sid = streamRef.current.id;
+          return streamRef.current.id;
+        };
+        if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
+          const sid = ensureStream();
           setItems((prev) => prev.map((m) => (m.kind === 'msg' && m.id === sid ? { ...m, text: m.text + chunk.text } : m)));
+        } else if (chunk?.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+          const sid = ensureStream();
+          setItems((prev) => prev.map((m) => (m.kind === 'msg' && m.id === sid ? { ...m, reasoning: (m.reasoning ?? '') + chunk.text } : m)));
         }
       } else if (ev.type === 'assistant/message') {
         const content = ev.data?.message?.content;
         const text = extractText(content);
+        const reasoning = extractReasoning(content);
         const images = extractImageRefs(content);
         if (streamRef.current) {
           const sid = streamRef.current.id;
-          setItems((prev) => prev.map((m) => (m.kind === 'msg' && m.id === sid ? { ...m, text: text || m.text, streaming: false, images: images.length ? images : m.images } : m)));
+          setItems((prev) => prev.map((m) => (m.kind === 'msg' && m.id === sid ? { ...m, text: text || m.text, reasoning: reasoning || m.reasoning, streaming: false, images: images.length ? images : m.images } : m)));
           streamRef.current = null;
-        } else if (text || images.length) {
-          setItems((prev) => [...prev, { kind: 'msg', id: `a-${ev.seq}`, role: 'assistant', text, images: images.length ? images : undefined }]);
+        } else if (text || reasoning || images.length) {
+          setItems((prev) => [...prev, { kind: 'msg', id: `a-${ev.seq}`, role: 'assistant', text, reasoning: reasoning || undefined, images: images.length ? images : undefined }]);
         }
       } else if (ev.type === 'tool/call') {
         const d = ev.data;
@@ -338,7 +392,7 @@ export default function App() {
       if (s.ok) setSessions(s.value.items);
       if (pr.ok) {
         setPresets(pr.value.presets);
-        setSelectedPreset((old) => old ?? pr.value.presets.find((x) => x.isDefault)?.id ?? null);
+        setSelectedPreset((old) => old ?? pr.value.presets.find((x) => x.id === 'minimal-bash')?.id ?? pr.value.presets.find((x) => x.id === 'minimal')?.id ?? pr.value.presets.find((x) => x.isDefault)?.id ?? null);
       }
       const list = s.ok ? s.value.items : [];
       const restore = restoreSessionRef.current;
@@ -348,7 +402,10 @@ export default function App() {
         sessionRef.current = target.sessionId;
         setActiveSessionId(target.sessionId);
         const res = await loadHistory(client, target.sessionId);
+        isAtBottomRef.current = true;
         setItems(res.items);
+        historyHasMoreRef.current = res.hasMore;
+        historyOldestSeqRef.current = res.oldestSeq;
         if (res.tokenUsage) setTokenUsage(res.tokenUsage);
       }
     })();
@@ -381,17 +438,50 @@ export default function App() {
     if (s.ok) setSessions(s.value.items);
   }, []);
 
+  // 上滑到顶时加载更早的一页历史（prepend）
+  const loadOlder = useCallback(async () => {
+    const c = clientRef.current;
+    const sid = sessionRef.current;
+    if (!c || !sid) return;
+    if (loadingOlderRef.current || !historyHasMoreRef.current) return;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    try {
+      const r = await c.history(sid, { beforeSeq: historyOldestSeqRef.current });
+      if (!r.ok || sessionRef.current !== sid) return;
+      const older = parseHistoryEvents(r.value.events);
+      const nextOldest = minEventSeq(r.value.events);
+      if (older.length > 0) setItems((prev) => [...older, ...prev]);
+      if (nextOldest !== undefined) historyOldestSeqRef.current = nextOldest;
+      historyHasMoreRef.current = r.value.hasMore;
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  }, []);
+
+  const toggleReasoning = useCallback((id: string) => {
+    setReasoningOpen((prev) => ({ ...prev, [id]: !prev[id] }));
+  }, []);
+
   const openSession = useCallback(async (sid: string) => {
     const c = clientRef.current;
     if (!c) return;
+    isAtBottomRef.current = true;
     sessionRef.current = sid;
     setActiveSessionId(sid);
     setItems([]);
     setBusy(false);
     setTokenUsage(null);
     setSidebarOpen(false);
+    setReasoningOpen({});
+    historyHasMoreRef.current = false;
+    historyOldestSeqRef.current = undefined;
+    loadingOlderRef.current = false;
     const res = await loadHistory(c, sid);
     setItems(res.items);
+    historyHasMoreRef.current = res.hasMore;
+    historyOldestSeqRef.current = res.oldestSeq;
     if (res.tokenUsage) setTokenUsage(res.tokenUsage);
   }, []);
 
@@ -406,6 +496,11 @@ export default function App() {
       sessionRef.current = r.value.sessionId;
       setActiveSessionId(r.value.sessionId);
       setItems([]);
+      isAtBottomRef.current = true;
+      setReasoningOpen({});
+      historyHasMoreRef.current = false;
+      historyOldestSeqRef.current = undefined;
+      loadingOlderRef.current = false;
       setBusy(false);
       setSidebarOpen(false);
       refreshLists();
@@ -470,6 +565,21 @@ export default function App() {
   const selectPreset = useCallback((id: string) => {
     setSelectedPreset(id);
   }, []);
+
+  // 切换当前会话的模式（Agent 预设）
+  const switchMode = useCallback(async (presetId: string) => {
+    const c = clientRef.current;
+    const sid = sessionRef.current;
+    if (!c || !sid) return;
+    setModeOpen(false);
+    const r = await c.selectAgentPreset(sid, presetId);
+    if (r.ok) {
+      setStatus('已切换模式: ' + presetId);
+      refreshLists();
+    } else {
+      setStatus('切换模式失败: ' + r.error.code);
+    }
+  }, [refreshLists]);
 
   const applyServerUrl = useCallback(() => {
     const url = serverUrl.trim().replace(/\/+$/, '');
@@ -608,6 +718,7 @@ export default function App() {
   }, [newWsPath, refreshLists]);
 
   const activeWorkspace = workspaces.find((w) => w.workspaceId === activeWorkspaceId);
+  const currentSession = sessions.find((s) => s.sessionId === activeSessionId);
 
   // 手动键盘监听：键盘弹出时把底部内容顶上去（零依赖，规避 RN edge-to-edge 下 adjustResize 失效）
   useEffect(() => {
@@ -653,10 +764,51 @@ export default function App() {
             style={styles.list}
             data={items}
             keyExtractor={(m) => m.id}
-            onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+            maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 10 }}
+            onContentSizeChange={() => {
+              // 只有用户停留在底部时才自动跟随新内容；上滑回看历史时不要强行拽回底部
+              if (isAtBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
+            }}
+            onScroll={(e: NativeSyntheticEvent<NativeScrollEvent>) => {
+              const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
+              const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+              isAtBottomRef.current = distanceFromBottom < 40;
+              // 滑到顶部时加载更早的一页历史（可与电脑完全同步到第一条）
+              if (contentOffset.y < 60) loadOlder();
+            }}
+            onScrollEndDrag={(e) => {
+              if (e.nativeEvent.contentOffset.y < 60) loadOlder();
+            }}
+            onMomentumScrollEnd={(e) => {
+              if (e.nativeEvent.contentOffset.y < 60) loadOlder();
+            }}
+            scrollEventThrottle={16}
+            ListHeaderComponent={
+              loadingOlder ? (
+                <View style={styles.loadingOlderRow}>
+                  <ActivityIndicator size="small" color="#3964fe" />
+                  <Text style={styles.loadingOlderText}>正在加载更早的记录…</Text>
+                </View>
+              ) : undefined
+            }
             renderItem={({ item }) =>
               item.kind === 'msg' ? (
                 <View style={[styles.bubble, item.role === 'user' ? styles.userBubble : styles.assistantBubble]}>
+                  {item.role === 'assistant' && item.reasoning ? (
+                    <View style={styles.reasoningWrap}>
+                      <TouchableOpacity style={styles.reasoningToggle} onPress={() => toggleReasoning(item.id)}>
+                        <Text style={styles.reasoningToggleText}>
+                          💭 思维链 {reasoningOpen[item.id] ? '▾' : '▸'}
+                        </Text>
+                      </TouchableOpacity>
+                      {reasoningOpen[item.id] ? (
+                        <Text style={styles.reasoningText}>
+                          {item.reasoning}
+                          {item.streaming ? '▍' : ''}
+                        </Text>
+                      ) : null}
+                    </View>
+                  ) : null}
                   <Text style={[styles.bubbleText, item.role === 'user' && styles.userText]}>
                     {renderPathText(item.text, downloadByPath)}
                     {item.streaming ? '▍' : ''}
@@ -699,7 +851,7 @@ export default function App() {
 
           <View style={styles.inputRow}>
             <TouchableOpacity style={styles.attachBtn} onPress={pickFile} disabled={!activeSessionId || busy}>
-              <Text style={styles.attachBtnText}>📎</Text>
+              <PaperclipIcon size={22} color="#000" />
             </TouchableOpacity>
             <TextInput
               style={styles.input}
@@ -752,6 +904,15 @@ export default function App() {
             </TouchableOpacity>
             <TouchableOpacity style={styles.newWsBtn} onPress={() => { setDownloadOpen(true); setSidebarOpen(false); }}>
               <Text style={styles.newWsBtnText}>⬇ 下载宿主机文件</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.newWsBtn}
+              onPress={() => { if (currentSession && !currentSession.blank) { setModeOpen(true); setSidebarOpen(false); } }}
+              disabled={!currentSession || currentSession.blank}
+            >
+              <Text style={[styles.newWsBtnText, (!currentSession || currentSession.blank) && { color: '#bbb' }]}>
+                🔄 切换模式{(!currentSession || currentSession.blank) ? '（首轮结束后可用）' : ''}
+              </Text>
             </TouchableOpacity>
 
             <ScrollView style={styles.sidebarScroll}>
@@ -905,6 +1066,32 @@ export default function App() {
           </View>
         </View>
       </Modal>
+
+      {/* 切换模式弹窗 */}
+      <Modal visible={modeOpen} transparent animationType="fade" onRequestClose={() => setModeOpen(false)}>
+        <View style={styles.centerOverlay}>
+          <View style={styles.actionCard}>
+            <Text style={styles.actionTitle}>切换当前会话模式</Text>
+            <ScrollView style={{ maxHeight: 420 }}>
+              {presets.map((p) => {
+                const isCurrent = currentSession?.agentPreset === p.id;
+                return (
+                  <TouchableOpacity
+                    key={p.id}
+                    style={[styles.optRow, isCurrent && styles.optRowActive]}
+                    onPress={() => switchMode(p.id)}
+                  >
+                    <Text style={styles.optRowText}>
+                      {p.name || p.id}{p.broken ? ' ⚠损坏' : ''}{isCurrent ? '（当前）' : ''}
+                    </Text>
+                    {isCurrent && <Text style={styles.optCheck}>✓</Text>}
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -1016,6 +1203,12 @@ const styles = StyleSheet.create({
   assistantBubble: { alignSelf: 'flex-start', backgroundColor: '#fff' },
   bubbleText: { fontSize: 15, lineHeight: 21, color: '#111' },
   userText: { color: '#fff' },
+  reasoningWrap: { marginBottom: 6 },
+  reasoningToggle: { paddingVertical: 2 },
+  reasoningToggleText: { fontSize: 13, color: '#7a5af8', fontWeight: '600' },
+  reasoningText: { fontSize: 13, lineHeight: 19, color: '#888', marginTop: 4, fontStyle: 'italic' },
+  loadingOlderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 10, gap: 8 },
+  loadingOlderText: { fontSize: 13, color: '#999' },
   toolCard: {
     alignSelf: 'stretch',
     backgroundColor: '#f0f3ff',

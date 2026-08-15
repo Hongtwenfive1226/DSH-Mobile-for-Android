@@ -141,8 +141,9 @@ export class DshClient {
   prompt(req: SessionPromptRequest) {
     return this.callUnary<SessionPromptValue>('session.prompt', req);
   }
-  history(sessionId: string) {
-    return this.callUnary<SessionHistoryValue>('session.history', { sessionId });
+  history(sessionId: string, opts: { beforeSeq?: number; maxMessages?: number } = {}) {
+    // compact: true 让主机只返回消息/工具等表层事件，跳过逐 token 的 assistant/chunk，历史页从 MB 级降到 KB 级
+    return this.callUnary<SessionHistoryValue>('session.history', { sessionId, compact: true, ...opts });
   }
   cancel(sessionId: string) {
     return this.callUnary<{ accepted: true }>('session.cancel', { sessionId });

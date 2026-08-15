@@ -10,7 +10,7 @@
 //
 // 用法：
 //   node forwarder.mjs                          # 默认监听 YOUR_TAILSCALE_IP:8787
-//   LISTEN_HOST=YOUR_TAILSCALE_IP LISTEN_PORT=8787 FILE_ROOT=D:\your-workspace node forwarder.mjs
+//   LISTEN_HOST=YOUR_TAILSCALE_IP LISTEN_PORT=8787 FILE_ROOT=/path/to/workspace node forwarder.mjs
 //
 // 安全：仅绑定 LISTEN_HOST（Tailscale IP）；文件读写限制在 FILE_ROOT 范围内。
 
@@ -23,7 +23,7 @@ const LISTEN_PORT = Number(process.env.LISTEN_PORT ?? 8787);
 const UPSTREAM_HOST = '127.0.0.1';
 const UPSTREAM_PORT = 3080;
 const UPSTREAM_AUTHORITY = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
-const FILE_ROOT = process.env.FILE_ROOT ?? 'D:\\your-workspace';
+const FILE_ROOT = process.env.FILE_ROOT ?? (process.platform === 'win32' ? 'D:\\your-workspace' : '/home/user/workspace');
 const INBOX_DIR = path.join(FILE_ROOT, 'shared-files');
 const MAX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
 
