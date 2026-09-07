@@ -75,20 +75,20 @@ DSH 官方预设（`standard`/`code`/`minimal`/`cordis`）只读，需复制一�
 
 ### 3. 开启「对话中更换模式」（必需的主机 patch）
 
-DSH 默认**只允许在空会话（尚未对话）时切换预设**，对话开始后会被 `agent-preset-locked` 拒绝。要让「对话中切换」生效，需要改一处源码（位于 DSH 安装目录，`npm update` 后会丢失，需重打）：
+DSH 默认**只允许在空会话（尚未对话）时切换预设**，对话开始后会被 `agent-preset-locked` 拒绝。要让「对话中切换」生效，需要改一处源码（位于 DSH 安装目录，**DSH 更新后会被覆盖，需重打**）。
 
-**文件**：`<DSH 安装目录>/node_modules/@deepseek-ai/dsh-host-apiproxy/lib/index.js`
-（Windows 常见位置：`%APPDATA%\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-host-apiproxy\lib\index.js`）
+**一键重打（推荐）**：本项目附带自动化脚本，会用标记检测并重复打上全部所需 patch：
 
-**改动**：在 `agentPreset.select` 的处理器里（搜索 `agent-preset-locked` 或 `sessionBlank`），删掉/注释掉 `swap` 里的这行判断——
-
-```js
-if (!sessionBlank(agent.session)) return err(request, { code: "agent-preset-locked", ... });
+```bash
+node poc/patch-dsh.mjs          # 自动定位 DSH 安装；或 node poc/patch-dsh.mjs <api-proxy lib/index.js>
 ```
 
-使 `swap` 直接执行 `presets.recompose(agent.ctx, agentPreset)` 并追加 `agent-preset/selected` 事件。改完**重启 DSH**。
+**打的是什么**：`<DSH 安装目录>/node_modules/@deepseek-ai/dsh-host-apiproxy/lib/index.js`（Windows 常见位置 `%APPDATA%\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-host-apiproxy\lib\index.js`）里两处——
 
-> 同文件还有一处可选优化（本仓库手机端已依赖）：给 `session.history` 加 `compact` 标志，跳过逐 token 的 `assistant/chunk`，让历史分页从约 8MB/页降到约 50KB/页。不改也能用，只是分页慢；改了需重启 DSH。
+1. `agentPreset.select` 处理器（搜索 `agent-preset-locked` 或 `sessionBlank`）：删掉 `swap` 里 `if (!sessionBlank(agent.session)) return err(...)` 检查，使对话中途也能 `recompose`。
+2. `session.history`（手机端已依赖的优化）：加 `compact` 标志，跳过逐 token 的 `assistant/chunk`，历史页从约 8MB/页降到约 50KB/页。
+
+改完**重启 DSH**。
 
 ### 4. （可选）桌面端也加「切换模式」按钮
 
