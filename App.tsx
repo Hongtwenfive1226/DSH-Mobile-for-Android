@@ -9,8 +9,6 @@ import {
   NativeSyntheticEvent,
   Platform,
   ScrollView,
-  Share,
-  StatusBar,
   StyleSheet,
   Text,
   TextInput,
@@ -23,6 +21,7 @@ import { pick, keepLocalCopy, types, isErrorWithCode, errorCodes } from '@react-
 import { CachesDirectoryPath, readFile as fsReadFile, writeFile as fsWriteFile } from '@dr.pogodin/react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DshClient } from './src/dsh/client';
+import { saveLocalFile } from './src/fileSave';
 import type {
   AgentPresetEntry,
   HistoryEntry,
@@ -617,12 +616,15 @@ export default function App() {
       setStatus('下载失败: ' + r.error.code);
       return;
     }
-    const ext = (r.value.attachment.mediaType || mediaType).split('/')[1] || 'png';
-    const path = `${CachesDirectoryPath}/dsh-download-${Date.now()}.${ext}`;
+    const attachment = r.value.attachment;
+    const actualMediaType = attachment.mediaType || mediaType;
+    const ext = actualMediaType.split('/')[1] || 'png';
+    const fallbackName = `dsh-download-${Date.now()}.${ext}`;
+    const path = `${CachesDirectoryPath}/${fallbackName}`;
     try {
       await fsWriteFile(path, r.value.data, 'base64');
-      await Share.share({ url: 'file://' + path, title: r.value.attachment.name || '下载的文件' });
-      setStatus('已弹出保存/分享');
+      const outcome = await saveLocalFile(path, attachment.name || fallbackName, actualMediaType);
+      setStatus(outcome === 'saved' ? '已保存文件' : '已弹出分享');
     } catch {
       setStatus('保存失败');
     }
@@ -635,8 +637,8 @@ export default function App() {
       const f = await downloadFile(appliedUrl, hostPath);
       const local = `${CachesDirectoryPath}/${f.name}`;
       await fsWriteFile(local, f.data, 'base64');
-      await Share.share({ url: 'file://' + local, title: f.name });
-      setStatus('已弹出保存/分享');
+      const outcome = await saveLocalFile(local, f.name);
+      setStatus(outcome === 'saved' ? '已保存文件' : '已弹出分享');
     } catch {
       setStatus('下载失败');
     }
