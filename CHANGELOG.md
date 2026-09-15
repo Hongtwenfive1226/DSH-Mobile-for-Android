@@ -2,6 +2,15 @@
 
 本项目的版本号（`versionCode` / `versionName`）与 APK 的 Android 版本信息一致。所有版本均可通过文件桥或 GitHub Release 下载。
 
+## v1.5（versionCode 6）— 2026-08-15
+
+**滚动回弹修复**
+
+- 🐛 修复「滑到最下时被弹回历史中段」：移除 `maintainVisibleContentPosition`。
+  该 Android 原生实现在上滑读历史时记录了锚点消息，之后任何内容变化（虚拟化补渲染、加载指示器增删）都会把视图拉回该锚点，表现为滚到底部却被弹回中段。
+- ♻️ 改为手动补偿：`loadOlder` 前记录滚动位置，`onContentSizeChange` 按内容增高量等量补偿偏移，prepend 更早历史时阅读位置保持不动，且不再影响向下滚动。
+- 🎨 顶部「正在加载更早的记录…」由列表头（会改变内容高度、干扰补偿）改为绝对定位浮层。
+
 ## v1.4（versionCode 5）— 2026-08-15
 
 **历史分页修复 + 黑色回形针图标**

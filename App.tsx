@@ -258,6 +258,12 @@ export default function App() {
   const historyHasMoreRef = useRef(false);
   const historyOldestSeqRef = useRef<number | undefined>(undefined);
   const loadingOlderRef = useRef(false);
+  // prepend 更早历史时的滚动位置补偿（替代 maintainVisibleContentPosition，
+  // 后者在 Android 上会保留旧锚点，导致滑到底部时被弹回历史中段）
+  const contentHeightRef = useRef(0);
+  const scrollYRef = useRef(0);
+  const pendingPrependRef = useRef(false);
+  const prependAnchorRef = useRef(0);
 
   // 载入持久化设置
   useEffect(() => {
@@ -403,6 +409,10 @@ export default function App() {
         setActiveSessionId(target.sessionId);
         const res = await loadHistory(client, target.sessionId);
         isAtBottomRef.current = true;
+        contentHeightRef.current = 0;
+        scrollYRef.current = 0;
+        pendingPrependRef.current = false;
+        prependAnchorRef.current = 0;
         setItems(res.items);
         historyHasMoreRef.current = res.hasMore;
         historyOldestSeqRef.current = res.oldestSeq;
@@ -451,7 +461,13 @@ export default function App() {
       if (!r.ok || sessionRef.current !== sid) return;
       const older = parseHistoryEvents(r.value.events);
       const nextOldest = minEventSeq(r.value.events);
-      if (older.length > 0) setItems((prev) => [...older, ...prev]);
+      if (older.length > 0) {
+        // 记录 prepend 前的滚动位置；内容增高后由 onContentSizeChange 补偿，
+        // 使当前阅读位置保持不动（新加载的更早内容留在上方）
+        prependAnchorRef.current = scrollYRef.current;
+        pendingPrependRef.current = true;
+        setItems((prev) => [...older, ...prev]);
+      }
       if (nextOldest !== undefined) historyOldestSeqRef.current = nextOldest;
       historyHasMoreRef.current = r.value.hasMore;
     } finally {
@@ -478,6 +494,10 @@ export default function App() {
     historyHasMoreRef.current = false;
     historyOldestSeqRef.current = undefined;
     loadingOlderRef.current = false;
+    contentHeightRef.current = 0;
+    scrollYRef.current = 0;
+    pendingPrependRef.current = false;
+    prependAnchorRef.current = 0;
     const res = await loadHistory(c, sid);
     setItems(res.items);
     historyHasMoreRef.current = res.hasMore;
@@ -501,6 +521,10 @@ export default function App() {
       historyHasMoreRef.current = false;
       historyOldestSeqRef.current = undefined;
       loadingOlderRef.current = false;
+      contentHeightRef.current = 0;
+      scrollYRef.current = 0;
+      pendingPrependRef.current = false;
+      prependAnchorRef.current = 0;
       setBusy(false);
       setSidebarOpen(false);
       refreshLists();
@@ -764,13 +788,29 @@ export default function App() {
             style={styles.list}
             data={items}
             keyExtractor={(m) => m.id}
-            maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 10 }}
-            onContentSizeChange={() => {
+            onContentSizeChange={(_w: number, h: number) => {
+              const prevHeight = contentHeightRef.current;
+              contentHeightRef.current = h;
+              // prepend 更早历史使内容从顶部增高：等量补偿滚动位置，
+              // 让当前阅读位置保持不动（不用 maintainVisibleContentPosition，
+              // 那个原生实现会保留旧锚点，导致滑到底部时被弹回历史中段）
+              if (pendingPrependRef.current) {
+                pendingPrependRef.current = false;
+                const delta = h - prevHeight;
+                if (delta > 0) {
+                  listRef.current?.scrollToOffset({
+                    offset: Math.max(0, prependAnchorRef.current + delta),
+                    animated: false,
+                  });
+                }
+                return;
+              }
               // 只有用户停留在底部时才自动跟随新内容；上滑回看历史时不要强行拽回底部
               if (isAtBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
             }}
             onScroll={(e: NativeSyntheticEvent<NativeScrollEvent>) => {
               const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
+              scrollYRef.current = contentOffset.y;
               const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
               isAtBottomRef.current = distanceFromBottom < 40;
               // 滑到顶部时加载更早的一页历史（可与电脑完全同步到第一条）
@@ -783,14 +823,6 @@ export default function App() {
               if (e.nativeEvent.contentOffset.y < 60) loadOlder();
             }}
             scrollEventThrottle={16}
-            ListHeaderComponent={
-              loadingOlder ? (
-                <View style={styles.loadingOlderRow}>
-                  <ActivityIndicator size="small" color="#3964fe" />
-                  <Text style={styles.loadingOlderText}>正在加载更早的记录…</Text>
-                </View>
-              ) : undefined
-            }
             renderItem={({ item }) =>
               item.kind === 'msg' ? (
                 <View style={[styles.bubble, item.role === 'user' ? styles.userBubble : styles.assistantBubble]}>
@@ -848,6 +880,14 @@ export default function App() {
               </View>
             }
           />
+
+          {/* 加载更早历史的提示做成浮层，不占用列表内容高度，避免干扰滚动位置补偿 */}
+          {loadingOlder ? (
+            <View style={styles.loadingOlderOverlay} pointerEvents="none">
+              <ActivityIndicator size="small" color="#3964fe" />
+              <Text style={styles.loadingOlderText}>正在加载更早的记录…</Text>
+            </View>
+          ) : null}
 
           <View style={styles.inputRow}>
             <TouchableOpacity style={styles.attachBtn} onPress={pickFile} disabled={!activeSessionId || busy}>
@@ -1207,8 +1247,21 @@ const styles = StyleSheet.create({
   reasoningToggle: { paddingVertical: 2 },
   reasoningToggleText: { fontSize: 13, color: '#7a5af8', fontWeight: '600' },
   reasoningText: { fontSize: 13, lineHeight: 19, color: '#888', marginTop: 4, fontStyle: 'italic' },
-  loadingOlderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 10, gap: 8 },
-  loadingOlderText: { fontSize: 13, color: '#999' },
+  loadingOlderOverlay: {
+    position: 'absolute',
+    top: 8,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.94)',
+    zIndex: 10,
+    elevation: 4,
+  },
+  loadingOlderText: { fontSize: 13, color: '#666' },
   toolCard: {
     alignSelf: 'stretch',
     backgroundColor: '#f0f3ff',
