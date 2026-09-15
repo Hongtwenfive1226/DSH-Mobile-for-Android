@@ -28,14 +28,23 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      # 显式安装本项目需要的 SDK 组件（逐个加引号，避免 ';' 被 shell 解释）。
-      # 注意：API 37 的平台包名带小版本号，是 platforms;android-37.0，不是 ;android-37。
-      - name: Install Android SDK packages
+      # 直接用 GitHub runner 预装的 Android SDK（ANDROID_HOME 已由镜像设置），
+      # 不再依赖 android-actions/setup-android：v3 是 Node20 旧版，在 Node24 runner 上会失败。
+      # 镜像已含 platforms;android-37.0 与 build-tools;37.0.0，这里只补装缺的 NDK 与 cmake。
+      - name: Install missing Android SDK packages
         run: |
-          sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then
+            SM="$(find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "${SM:-}" ] || [ ! -x "$SM" ]; then
+            echo "sdkmanager not found under $SDK"; ls -R "$SDK/cmdline-tools" || true; exit 1
+          fi
+          "$SM" --version
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" --install "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
 
       # 本地锁文件/包装器面向国内网络，GitHub 机器上换成官方源。
       - name: Normalize npm registry (npmmirror -> npmjs)
