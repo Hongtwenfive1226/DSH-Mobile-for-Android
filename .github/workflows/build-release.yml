@@ -67,25 +67,17 @@ jobs:
           set -o pipefail
           ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon --stacktrace 2>&1 | tee /tmp/gradle-build.log
 
-      # 构建失败时把日志尾部写进 job summary（summary 可被公开 API 读取，便于远程排查）
+      # 构建失败时把日志关键段落发成 annotation（annotation 可被公开 API 读取，便于远程排查）
       - name: Report build failure
         if: steps.build.outcome == 'failure'
         run: |
-          {
-            echo "## Gradle build failed"
-            echo ""
-            echo "### Environment"
-            echo '```'
-            java -version 2>&1 || true
-            echo "ANDROID_HOME=$ANDROID_HOME"
-            df -h / /home 2>/dev/null || df -h || true
-            echo '```'
-            echo ""
-            echo "### Last 150 log lines"
-            echo '```'
-            tail -n 150 /tmp/gradle-build.log 2>/dev/null || echo '(no log)'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          LOG=/tmp/gradle-build.log
+          emit() { while IFS= read -r l; do [ -n "$l" ] && printf '::error::%s\n' "$l"; done; }
+          echo "::error::java=$(java -version 2>&1 | head -n 1) | disk=$(df -h / | tail -n 1 | tr -s ' ')"
+          echo "== gradle: What went wrong ==" | emit
+          awk '/What went wrong:/{f=1} f{print} /^\* Try:/{f=0}' "$LOG" 2>/dev/null | head -n 25 | emit
+          echo "== gradle: log tail ==" | emit
+          tail -n 12 "$LOG" 2>/dev/null | emit
           exit 1
 
       - name: Upload APK artifact
