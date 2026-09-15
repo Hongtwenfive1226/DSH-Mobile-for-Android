@@ -65,6 +65,8 @@ jobs:
         working-directory: android
         run: |
           set -o pipefail
+          # Windows 提交的仓库可能丢失可执行位，这里兜底（仓库里已设为 100755）
+          chmod +x ./gradlew || true
           ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon --stacktrace 2>&1 | tee /tmp/gradle-build.log
 
       # 构建失败时把日志关键段落发成 annotation（annotation 可被公开 API 读取，便于远程排查）
