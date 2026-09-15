@@ -60,8 +60,33 @@ jobs:
         run: npm ci
 
       - name: Build release APK (arm64-v8a)
-        run: ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+        id: build
+        continue-on-error: true
         working-directory: android
+        run: |
+          set -o pipefail
+          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon --stacktrace 2>&1 | tee /tmp/gradle-build.log
+
+      # 构建失败时把日志尾部写进 job summary（summary 可被公开 API 读取，便于远程排查）
+      - name: Report build failure
+        if: steps.build.outcome == 'failure'
+        run: |
+          {
+            echo "## Gradle build failed"
+            echo ""
+            echo "### Environment"
+            echo '```'
+            java -version 2>&1 || true
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            df -h / /home 2>/dev/null || df -h || true
+            echo '```'
+            echo ""
+            echo "### Last 150 log lines"
+            echo '```'
+            tail -n 150 /tmp/gradle-build.log 2>/dev/null || echo '(no log)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
