@@ -30,12 +30,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platforms;android-37
-            build-tools;37.0.0
-            ndk;27.1.12297006
-            cmake;3.22.1
+
+      # 显式安装本项目需要的 SDK 组件（逐个加引号，避免 ';' 被 shell 解释）。
+      # 注意：API 37 的平台包名带小版本号，是 platforms;android-37.0，不是 ;android-37。
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.1.12297006" "cmake;3.22.1"
 
       # 本地锁文件/包装器面向国内网络，GitHub 机器上换成官方源。
       - name: Normalize npm registry (npmmirror -> npmjs)
