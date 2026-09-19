@@ -23,6 +23,7 @@ import { pick, keepLocalCopy, types, isErrorWithCode, errorCodes } from '@react-
 import { CachesDirectoryPath, readFile as fsReadFile, writeFile as fsWriteFile } from '@dr.pogodin/react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DshClient } from './src/dsh/client';
+import Markdown from './src/ui/Markdown';
 import type {
   AgentPresetEntry,
   HistoryEntry,
@@ -841,10 +842,18 @@ export default function App() {
                       ) : null}
                     </View>
                   ) : null}
-                  <Text style={[styles.bubbleText, item.role === 'user' && styles.userText]}>
-                    {renderPathText(item.text, downloadByPath)}
-                    {item.streaming ? '▍' : ''}
-                  </Text>
+                  {item.role === 'assistant' ? (
+                    item.text ? (
+                      <Markdown text={item.streaming ? `${item.text} ▍` : item.text} onPath={downloadByPath} />
+                    ) : item.streaming ? (
+                      <Text style={styles.bubbleText}>▍</Text>
+                    ) : null
+                  ) : (
+                    <Text style={[styles.bubbleText, styles.userText]}>
+                      {renderPathText(item.text, downloadByPath)}
+                      {item.streaming ? '▍' : ''}
+                    </Text>
+                  )}
                   {item.images?.map((im, i) => (
                     <TouchableOpacity
                       key={i}
