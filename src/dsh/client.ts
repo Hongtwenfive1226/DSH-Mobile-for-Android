@@ -10,7 +10,9 @@ import {
   HostFrame,
   ModelSelection,
   MuxFrame,
+  QuestionResponsePayload,
   RespondReceipt,
+  RespondResult,
   RpcResult,
   ServerRequest,
   ServerResponse,
@@ -113,9 +115,9 @@ export class DshClient {
     };
   }
 
-  // 应答审批帧（POST /api/respond）
-  async respond(rpcId: string, value: ApprovalResponsePayload): Promise<RespondReceipt> {
-    const message: ClientResponse = { type: 'client-response', rpcId, result: { ok: true, value } };
+  // 应答 server-request 帧（POST /api/respond）——审批与 AI 提问共用同一通道
+  private async postRespond(rpcId: string, result: RespondResult): Promise<RespondReceipt> {
+    const message: ClientResponse = { type: 'client-response', rpcId, result };
     const res = await fetch(`${this.baseUrl}/api/respond`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -123,6 +125,24 @@ export class DshClient {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status} for respond`);
     return (await res.json()) as RespondReceipt;
+  }
+
+  // 应答审批帧
+  async respond(rpcId: string, value: ApprovalResponsePayload): Promise<RespondReceipt> {
+    return this.postRespond(rpcId, { ok: true, value });
+  }
+
+  // 回答 AI 提问（ask_user_question）：value 形如 { sessionId, answer: { answers: [...] } }
+  async answerQuestion(rpcId: string, value: QuestionResponsePayload): Promise<RespondReceipt> {
+    return this.postRespond(rpcId, { ok: true, value });
+  }
+
+  // 取消 AI 提问（宿主把该次工具调用判为 cancelled）
+  async cancelQuestion(rpcId: string): Promise<RespondReceipt> {
+    return this.postRespond(rpcId, {
+      ok: false,
+      error: { code: 'cancelled', message: 'the user closed this question request', details: {} },
+    });
   }
 
   // ---- 高层 API ----

@@ -2,6 +2,21 @@
 
 本项目的版本号（`versionCode` / `versionName`）与 APK 的 Android 版本信息一致。所有版本均可通过文件桥或 GitHub Release 下载。
 
+## v1.8（versionCode 9）— 2026-09-19
+
+**手机端回答 AI 提问（ask_user_question）**
+
+- ✨ 新增「AI 提问」弹窗：模型调用 `ask_user_question` 时，手机上可直接作答，无需回到电脑。
+  - 支持单选题（点选互斥）与多选题（可多选），选项带描述
+  - 每题都可填「自定义答案」；单选下选项与自定义答案自动互斥（符合宿主校验规则）
+  - 多题一次性展示，逐题作答后统一提交；顶部显示「问题 i / n」
+  - `detail`（如 plan-review 的计划正文）以可滚动区域展示
+  - 可取消（宿主把该次工具调用判为 `cancelled`）
+- 🔌 协议：走 DSH 的 `question/requested` server-request 帧（events.mux 下行），
+  作答通过 `POST /api/respond` 的 `client-response` 回传（与审批同一通道）。
+- 🧪 新增 `__tests__/questions.test.ts`（17 条）：守住宿主 `matchesQuestions` 的硬规则
+  （等长/id 对齐、单选至多一项、custom 与 selected 在单选下互斥、custom 非空等）。
+
 ## v1.7（versionCode 8）— 2026-09-19
 
 **紧急修复：Markdown 表格导致 App 卡死**

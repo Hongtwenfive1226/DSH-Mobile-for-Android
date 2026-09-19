@@ -75,13 +75,42 @@ export type MuxFrame =
   | { type: 'session/subscribed'; sessionId: string; lastSeq: number }
   | { type: 'session/projection'; sessionId: string; key: string; value: unknown; seq: number }
   | { type: 'approval/requested'; sessionId: string; approvalId: string; toolName: string; callId?: string; reason?: string }
-  | { type: 'question/requested'; sessionId: string; questions: unknown[] }
+  | { type: 'question/requested'; sessionId: string; questions: AskUserQuestion[] }
+  | { type: 'question/resolved'; sessionId: string; questionRpcId: string; outcome: 'answered' | 'cancelled' }
   | { type: 'session/queue'; sessionId: string; items: unknown[] }
   | { type: 'session/jobs'; sessionId: string; jobs: unknown[] }
   | { type: 'stream/error'; error: unknown }
   | { type: string; [k: string]: unknown };
 
 export type HostFrame = { type: string; [k: string]: unknown };
+
+// ---- AI 提问（模型调用 ask_user_question 时下发）----
+export interface AskUserQuestionOption {
+  label: string;
+  description?: string;
+}
+export interface AskUserQuestionIntent {
+  kind: 'plan-review';
+  /** intent 为 plan-review 时，options 中代表「同意」的那个 label */
+  approve: string;
+}
+export interface AskUserQuestion {
+  id: string;
+  question: string;
+  header?: string;
+  detail?: string;
+  options?: AskUserQuestionOption[];
+  multiSelect?: boolean;
+  intent?: AskUserQuestionIntent;
+}
+export interface AskUserQuestionAnswerItem {
+  id: string;
+  selected: string[];
+  custom?: string;
+}
+export interface AskUserQuestionAnswer {
+  answers: AskUserQuestionAnswerItem[];
+}
 
 // ---- 流式块（assistant/chunk 事件的 event.data.chunk）----
 export type ContentBlock =
@@ -184,16 +213,23 @@ export interface SessionAttachmentValue {
   data: string; // base64
 }
 
-// ---- 应答信封（审批）----
+// ---- 应答信封（审批 / 提问）----
+export type RespondResult =
+  | { ok: true; value: unknown }
+  | { ok: false; error: { code: string; message: string; details: unknown } };
 export interface ClientResponse {
   type: 'client-response';
   rpcId: string;
-  result: { ok: true; value: unknown };
+  result: RespondResult;
 }
 export interface ApprovalResponsePayload {
   sessionId: string;
   approvalId: string;
   outcome: 'allowed-once' | 'rejected';
+}
+export interface QuestionResponsePayload {
+  sessionId: string;
+  answer: AskUserQuestionAnswer;
 }
 export interface RespondReceipt {
   accepted: boolean;

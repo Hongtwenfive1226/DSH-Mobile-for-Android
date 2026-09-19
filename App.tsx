@@ -23,9 +23,17 @@ import { pick, keepLocalCopy, types, isErrorWithCode, errorCodes } from '@react-
 import { CachesDirectoryPath, readFile as fsReadFile, writeFile as fsWriteFile } from '@dr.pogodin/react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DshClient } from './src/dsh/client';
+import {
+  buildQuestionAnswers,
+  questionAnswered,
+  setCustomDraft,
+  toggleOptionDraft,
+} from './src/dsh/questions';
+import type { QuestionDraft } from './src/dsh/questions';
 import Markdown from './src/ui/Markdown';
 import type {
   AgentPresetEntry,
+  AskUserQuestion,
   HistoryEntry,
   HostFrame,
   MuxFrame,
@@ -53,6 +61,13 @@ interface PendingApproval {
   approvalId: string;
   toolName: string;
   reason?: string;
+}
+
+/** AI 提问（ask_user_question）：宿主的 server-request 帧 + 本地的作答草稿 */
+interface PendingQuestion {
+  rpcId: string;
+  sessionId: string;
+  questions: AskUserQuestion[];
 }
 
 function extractText(content: any): string {
@@ -237,6 +252,10 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [view, setView] = useState<'chat' | 'settings'>('chat');
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
+  const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
+  const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraft>>({});
+  const [questionBusy, setQuestionBusy] = useState(false);
+  const [questionError, setQuestionError] = useState<string | null>(null);
   const [actionTarget, setActionTarget] = useState<
     { kind: 'session'; s: SessionSummary } | { kind: 'workspace'; w: WorkspaceView } | null
   >(null);
@@ -323,6 +342,21 @@ export default function App() {
       }
       if (p.type === 'approval/resolved') {
         setPendingApproval((cur) => (cur && cur.approvalId === p.approvalId ? null : cur));
+        return;
+      }
+      if (p.type === 'question/requested') {
+        // AI 提问：模型调用 ask_user_question 时阻塞等待，这里弹窗收集答案
+        const questions: AskUserQuestion[] = Array.isArray(p.questions) ? p.questions : [];
+        if (questions.length === 0) return;
+        setPendingQuestion({ rpcId, sessionId: p.sessionId, questions });
+        setQuestionDrafts(
+          Object.fromEntries(questions.map((q) => [q.id, { selected: [], custom: '' } as QuestionDraft])),
+        );
+        setQuestionBusy(false);
+        return;
+      }
+      if (p.type === 'question/resolved') {
+        setPendingQuestion((cur) => (cur && cur.rpcId === p.questionRpcId ? null : cur));
         return;
       }
       if (p.type === 'session/projection' && p.sessionId === sessionRef.current && p.key === 'tokenUsage') {
@@ -678,6 +712,64 @@ export default function App() {
     }
   }, [pendingApproval]);
 
+  // 提交 AI 提问的答案
+  const submitQuestion = useCallback(async () => {
+    if (!pendingQuestion || questionBusy) return;
+    if (!questionAnswered(pendingQuestion.questions, questionDrafts)) {
+      setQuestionError('请为每个问题选择选项或填写答案');
+      return;
+    }
+    setQuestionBusy(true);
+    setQuestionError(null);
+    const { rpcId, sessionId, questions } = pendingQuestion;
+    try {
+      const receipt = await clientRef.current?.answerQuestion(rpcId, {
+        sessionId,
+        answer: { answers: buildQuestionAnswers(questions, questionDrafts) },
+      });
+      if (receipt && !receipt.accepted) {
+        setQuestionBusy(false);
+        setQuestionError(`提交被拒绝（${receipt.reason ?? 'unknown'}）`);
+        return;
+      }
+      setPendingQuestion(null);
+    } catch (e: any) {
+      setQuestionBusy(false);
+      setQuestionError(`提交失败：${e?.message ?? String(e)}`);
+    }
+  }, [pendingQuestion, questionDrafts, questionBusy]);
+
+  // 取消 AI 提问（宿主把该次工具调用判为 cancelled）
+  const cancelQuestion = useCallback(async () => {
+    if (!pendingQuestion || questionBusy) return;
+    setQuestionBusy(true);
+    setQuestionError(null);
+    try {
+      await clientRef.current?.cancelQuestion(pendingQuestion.rpcId);
+      setPendingQuestion(null);
+    } catch (e: any) {
+      setQuestionBusy(false);
+      setQuestionError(`取消失败：${e?.message ?? String(e)}`);
+    }
+  }, [pendingQuestion, questionBusy]);
+
+  // 切换某个问题的某个选项（单选互斥，多选取反）
+  const toggleOption = useCallback((question: AskUserQuestion, label: string) => {
+    setQuestionError(null);
+    setQuestionDrafts((prev) => {
+      const cur = prev[question.id] ?? { selected: [], custom: '' };
+      return { ...prev, [question.id]: toggleOptionDraft(question, cur, label) };
+    });
+  }, []);
+
+  const setQuestionCustom = useCallback((question: AskUserQuestion, text: string) => {
+    setQuestionError(null);
+    setQuestionDrafts((prev) => {
+      const cur = prev[question.id] ?? { selected: [], custom: '' };
+      return { ...prev, [question.id]: setCustomDraft(question, cur, text) };
+    });
+  }, []);
+
   // 会话/工作区操作
   const confirmRename = useCallback(async () => {
     const t = actionTarget;
@@ -1022,6 +1114,91 @@ export default function App() {
               </TouchableOpacity>
               <TouchableOpacity style={[styles.approvalBtn, styles.rejectBtn]} onPress={() => respondApproval('rejected')}>
                 <Text style={styles.approvalBtnText}>拒绝</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* AI 提问弹窗（ask_user_question）——手机上回答 AI 的提问 */}
+      <Modal
+        visible={!!pendingQuestion}
+        transparent
+        animationType="fade"
+        onRequestClose={() => { void cancelQuestion(); }}
+      >
+        <View style={styles.centerOverlay}>
+          <View style={styles.questionCard}>
+            <Text style={styles.questionTitle}>AI 提问</Text>
+            <ScrollView style={styles.questionScroll} keyboardShouldPersistTaps="handled">
+              {pendingQuestion?.questions.map((q, qi) => {
+                const draft = questionDrafts[q.id] ?? { selected: [], custom: '' };
+                const isMulti = q.multiSelect === true;
+                return (
+                  <View key={q.id} style={styles.questionBlock}>
+                    {pendingQuestion.questions.length > 1 ? (
+                      <Text style={styles.questionIndex}>问题 {qi + 1} / {pendingQuestion.questions.length}</Text>
+                    ) : null}
+                    {!!q.header && <Text style={styles.questionHeader}>{q.header}</Text>}
+                    <Text style={styles.questionText}>{q.question}</Text>
+                    {!!q.detail && (
+                      <ScrollView style={styles.questionDetailBox} nestedScrollEnabled>
+                        <Text style={styles.questionDetail}>{q.detail}</Text>
+                      </ScrollView>
+                    )}
+                    {isMulti ? <Text style={styles.questionHint}>可多选</Text> : null}
+
+                    {q.options?.map((opt) => {
+                      const on = draft.selected.includes(opt.label);
+                      return (
+                        <TouchableOpacity
+                          key={opt.label}
+                          style={[styles.questionOption, on && styles.questionOptionOn]}
+                          onPress={() => toggleOption(q, opt.label)}
+                          disabled={questionBusy}
+                        >
+                          <Text style={[styles.questionOptionMark, on && styles.questionOptionMarkOn]}>
+                            {isMulti ? (on ? '☑' : '☐') : on ? '◉' : '○'}
+                          </Text>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.questionOptionLabel}>{opt.label}</Text>
+                            {!!opt.description && (
+                              <Text style={styles.questionOptionDesc}>{opt.description}</Text>
+                            )}
+                          </View>
+                        </TouchableOpacity>
+                      );
+                    })}
+
+                    <TextInput
+                      style={styles.questionCustomInput}
+                      value={draft.custom}
+                      onChangeText={(t) => setQuestionCustom(q, t)}
+                      placeholder={q.options?.length ? '或输入自定义答案…' : '输入你的答案…'}
+                      multiline
+                      editable={!questionBusy}
+                    />
+                  </View>
+                );
+              })}
+            </ScrollView>
+
+            {!!questionError && <Text style={styles.questionError}>{questionError}</Text>}
+
+            <View style={styles.approvalBtns}>
+              <TouchableOpacity
+                style={[styles.approvalBtn, styles.rejectBtn]}
+                onPress={() => { void cancelQuestion(); }}
+                disabled={questionBusy}
+              >
+                <Text style={styles.approvalBtnText}>取消</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.approvalBtn, styles.approveBtn, questionBusy && styles.btnDisabled]}
+                onPress={() => { void submitQuestion(); }}
+                disabled={questionBusy}
+              >
+                <Text style={styles.approvalBtnText}>{questionBusy ? '提交中…' : '提交'}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -1381,6 +1558,46 @@ const styles = StyleSheet.create({
   approveBtn: { backgroundColor: '#3964fe' },
   rejectBtn: { backgroundColor: '#c0392b' },
   approvalBtnText: { color: '#fff', fontWeight: '600' },
+  btnDisabled: { opacity: 0.5 },
+  // AI 提问弹窗
+  questionCard: { width: '94%', maxHeight: '82%', backgroundColor: '#fff', borderRadius: 14, padding: 16 },
+  questionTitle: { fontSize: 16, fontWeight: '700', color: '#111', marginBottom: 8 },
+  questionScroll: { flexGrow: 0 },
+  questionBlock: { marginBottom: 16 },
+  questionIndex: { fontSize: 12, color: '#888', marginBottom: 4 },
+  questionHeader: { fontSize: 13, fontWeight: '700', color: '#7a5af8', marginBottom: 2 },
+  questionText: { fontSize: 15, lineHeight: 22, color: '#111', marginBottom: 8 },
+  questionHint: { fontSize: 12, color: '#888', marginBottom: 4 },
+  questionDetailBox: { maxHeight: 160, backgroundColor: '#f6f7f9', borderRadius: 8, padding: 8, marginBottom: 8 },
+  questionDetail: { fontSize: 13, lineHeight: 19, color: '#333' },
+  questionOption: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    borderWidth: 1,
+    borderColor: '#e3e6ea',
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+    backgroundColor: '#fff',
+  },
+  questionOptionOn: { borderColor: '#3964fe', backgroundColor: '#eef2ff' },
+  questionOptionMark: { fontSize: 16, color: '#98a2b3', marginRight: 8, lineHeight: 20 },
+  questionOptionMarkOn: { color: '#3964fe' },
+  questionOptionLabel: { fontSize: 14, color: '#111' },
+  questionOptionDesc: { fontSize: 12, color: '#777', marginTop: 2, lineHeight: 17 },
+  questionCustomInput: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 14,
+    color: '#111',
+    minHeight: 40,
+    maxHeight: 110,
+    textAlignVertical: 'top',
+  },
+  questionError: { fontSize: 12, color: '#c0392b', marginTop: 6 },
   actionCard: { width: '86%', backgroundColor: '#fff', borderRadius: 14, padding: 16 },
   actionTitle: { fontSize: 15, fontWeight: '700', color: '#111', marginBottom: 10 },
   actionHint: { fontSize: 12, color: '#888', marginBottom: 8 },
