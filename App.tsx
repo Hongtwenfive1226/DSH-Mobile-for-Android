@@ -31,6 +31,7 @@ import {
 } from './src/dsh/questions';
 import type { QuestionDraft } from './src/dsh/questions';
 import Markdown from './src/ui/Markdown';
+import ErrorBoundary from './src/ui/ErrorBoundary';
 import type {
   AgentPresetEntry,
   AskUserQuestion,
@@ -848,6 +849,8 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
+      {/* 最外层兜底：任何未预期的渲染异常都显示成可读的错误面板，而不是整屏白屏 */}
+      <ErrorBoundary label="应用">
       <SafeAreaView style={styles.safe} edges={['top', 'bottom', 'left', 'right']}>
         {view === 'chat' ? (
         <>
@@ -876,6 +879,14 @@ export default function App() {
           </View>
 
           <View style={[styles.chatBody, { paddingBottom: kbHeight }]}>
+          {/* 消息列表单独兜底：某条消息渲染失败也不会带崩整个界面 */}
+          <ErrorBoundary
+            label="消息列表"
+            onRetry={() => {
+              const sid = sessionRef.current;
+              if (sid) void openSession(sid);
+            }}
+          >
           <FlatList
             ref={listRef}
             style={styles.list}
@@ -981,6 +992,7 @@ export default function App() {
               </View>
             }
           />
+          </ErrorBoundary>
 
           {/* 加载更早历史的提示做成浮层，不占用列表内容高度，避免干扰滚动位置补偿 */}
           {loadingOlder ? (
@@ -1319,6 +1331,7 @@ export default function App() {
         </View>
       </Modal>
       </SafeAreaView>
+      </ErrorBoundary>
     </SafeAreaProvider>
   );
 }

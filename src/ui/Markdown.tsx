@@ -353,12 +353,40 @@ export interface MarkdownProps {
   onPath?: (p: string) => void;
 }
 
+/**
+ * 单条消息的 Markdown 兜底：解析或渲染失败时退化为纯文本，
+ * 而不是把整个列表（甚至整个界面）带崩。release 包里没有红屏，这一层很有用。
+ */
+class MarkdownBoundary extends React.Component<{ text: string; children: React.ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  componentDidCatch(error: unknown) {
+    console.error('[DSHMobile] markdown render failed, falling back to plain text', error);
+  }
+  render() {
+    if (this.state.failed) return <Text style={styles.para}>{this.props.text}</Text>;
+    return this.props.children;
+  }
+}
+
 const Markdown = React.memo(function Markdown({ text, onPath }: MarkdownProps) {
   const nodes = React.useMemo(() => {
-    const tokens = md.parse(text ?? '', {}) as unknown as MdToken[];
-    return blockNodes(tokens, 'md', { onPath });
+    try {
+      const tokens = md.parse(text ?? '', {}) as unknown as MdToken[];
+      return blockNodes(tokens, 'md', { onPath });
+    } catch (error) {
+      console.error('[DSHMobile] markdown parse failed, falling back to plain text', error);
+      return null;
+    }
   }, [text, onPath]);
-  return <View>{nodes}</View>;
+  if (nodes === null) return <Text style={styles.para}>{text}</Text>;
+  return (
+    <MarkdownBoundary text={text}>
+      <View>{nodes}</View>
+    </MarkdownBoundary>
+  );
 });
 
 export default Markdown;
