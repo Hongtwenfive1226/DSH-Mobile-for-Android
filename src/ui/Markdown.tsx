@@ -80,6 +80,7 @@ function inlineNodes(tokens: MdToken[] | null, keyPrefix: string, ctx: Ctx): Rea
   let i = 0;
   let k = 0;
   while (i < tokens.length) {
+    const prev = i;
     const t = tokens[i];
     if (t.type === 'text') {
       out.push(...textWithPaths(t.content, `${keyPrefix}t${k++}`, ctx));
@@ -153,6 +154,8 @@ function inlineNodes(tokens: MdToken[] | null, keyPrefix: string, ctx: Ctx): Rea
     } else {
       i += 1;
     }
+    // 保险：任何分支都必须让下标前进，避免死循环卡死 JS 线程
+    if (i <= prev) i = prev + 1;
   }
   return out;
 }
@@ -180,6 +183,7 @@ function renderList(tokens: MdToken[], start: number, ctx: Ctx, keyPrefix: strin
   let i = 0;
   let n = 0;
   while (i < inner.length) {
+    const prev = i;
     if (inner[i].type !== 'list_item_open') {
       i += 1;
       continue;
@@ -195,6 +199,8 @@ function renderList(tokens: MdToken[], start: number, ctx: Ctx, keyPrefix: strin
     );
     n += 1;
     i = item.next;
+    // 保险：任何分支都必须让下标前进，避免死循环卡死 JS 线程
+    if (i <= prev) i = prev + 1;
   }
   return { node: <View key={keyPrefix}>{items}</View>, next };
 }
@@ -205,14 +211,20 @@ function renderTable(tokens: MdToken[], start: number, ctx: Ctx, keyPrefix: stri
   let header = false;
   let i = 0;
   while (i < inner.length) {
+    const prev = i;
     const t = inner[i];
-    if (t.type === 'thead_open') header = true;
-    else if (t.type === 'thead_close') header = false;
-    else if (t.type === 'tr_open') {
+    if (t.type === 'thead_open') {
+      header = true;
+      i += 1;
+    } else if (t.type === 'thead_close') {
+      header = false;
+      i += 1;
+    } else if (t.type === 'tr_open') {
       const row = collect(inner, i);
       const cells: MdToken[][] = [];
       let j = 0;
       while (j < row.inner.length) {
+        const prevJ = j;
         if (row.inner[j].type === 'th_open' || row.inner[j].type === 'td_open') {
           const cell = collect(row.inner, j);
           const inline = cell.inner.find((c) => c.type === 'inline');
@@ -221,12 +233,15 @@ function renderTable(tokens: MdToken[], start: number, ctx: Ctx, keyPrefix: stri
         } else {
           j += 1;
         }
+        // 保险：任何分支都必须让下标前进，避免死循环卡死 JS 线程
+        if (j <= prevJ) j = prevJ + 1;
       }
       rows.push({ header, cells });
       i = row.next;
     } else {
       i += 1;
     }
+    if (i <= prev) i = prev + 1;
   }
 
   return {
@@ -254,6 +269,7 @@ function blockNodes(tokens: MdToken[], keyPrefix: string, ctx: Ctx): React.React
   let i = 0;
   let k = 0;
   while (i < tokens.length) {
+    const prev = i;
     const t = tokens[i];
     switch (t.type) {
       case 'heading_open': {
@@ -324,6 +340,8 @@ function blockNodes(tokens: MdToken[], keyPrefix: string, ctx: Ctx): React.React
       default:
         i += 1;
     }
+    // 保险：任何分支都必须让下标前进，避免死循环卡死 JS 线程
+    if (i <= prev) i = prev + 1;
   }
   return out;
 }

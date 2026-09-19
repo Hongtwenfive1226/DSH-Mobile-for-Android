@@ -2,6 +2,17 @@
 
 本项目的版本号（`versionCode` / `versionName`）与 APK 的 Android 版本信息一致。所有版本均可通过文件桥或 GitHub Release 下载。
 
+## v1.7（versionCode 8）— 2026-09-19
+
+**紧急修复：Markdown 表格导致 App 卡死**
+
+- 🐛 修复 v1.6 引入的严重 bug：`renderTable` 遍历 token 时，遇到 `thead_open` / `thead_close`
+  **只设置标志位、没有推进下标**，形成死循环把 JS 线程锁死 —— 只要会话里出现过 Markdown 表格，
+  App 就会表现为「对话一直加载不出来、任何按钮都点不动」。
+- 🛡 给 Markdown 渲染器所有 token 遍历循环加上「下标必须前进」的保险，杜绝同类死循环再次锁死界面。
+- ✅ 新增 `__tests__/Markdown.test.tsx` 回归测试（9 条）：表格/标题/强调/代码块/嵌套列表/引用/
+  链接与宿主路径/原始 HTML/混合长文档，其中表格用例专门守住这次的问题。
+
 ## v1.6（versionCode 7）— 2026-09-16
 
 **Markdown 渲染**
