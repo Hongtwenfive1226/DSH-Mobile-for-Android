@@ -2,6 +2,21 @@
 
 本项目的版本号（`versionCode` / `versionName`）与 APK 的 Android 版本信息一致。所有版本均可通过文件桥或 GitHub Release 下载。
 
+## v1.10（versionCode 11）— 2026-09-20
+
+**底部空白与「切会话后滚不到底」修复**
+
+- 🐛 修复「最下方消息下面留大段空白」：
+  - `removeClippedSubviews={false}` —— Android 默认开启离屏视图分离，在变高消息列表里会造成大段空白区域；
+  - 内容**短于视口时贴底显示**（`contentContainerStyle` 的 `flexGrow + justifyContent:'flex-end'`），与电脑端一致，最后一条下面不再留空；
+  - 内边距从 `style` 移到 `contentContainerStyle`（Android 上 `style` 的 padding 会裁切内容）。
+- 🐛 修复「切换会话后时不时无法下滚到底部」：根因是首帧的 `onScroll` 会先把
+  「在底部」标记冲成 false，导致加载完成那一刻不再自动滚到底。新增独立的
+  `pendingBottomRef`（打开/切换/新建会话时置位，强制落底），**用户一旦手动拖动就交还控制权**
+  （`onScrollBeginDrag` 清除），不再依赖易被覆盖的标记。
+- 🛡 键盘残留高度加固：会话切换时清零 `kbHeight`，并补挂 `keyboardWillShow/WillHide`
+  双保险（漏报一个事件会残留一块底部空白）。
+
 ## v1.9（versionCode 10）— 2026-09-20
 
 **防白屏与错误可见化（诊断加固）**

@@ -285,6 +285,10 @@ export default function App() {
   const scrollYRef = useRef(0);
   const pendingPrependRef = useRef(false);
   const prependAnchorRef = useRef(0);
+  // 打开/切换会话后强制「落到最新一条」：不依赖 isAtBottomRef，
+  // 避免首帧的 onScroll 把标记冲掉导致停在顶部（表现为无法下滚到底部）。
+  // 用户一旦手动拖动列表即交还控制权（onScrollBeginDrag 清除）。
+  const pendingBottomRef = useRef(false);
 
   // 载入持久化设置
   useEffect(() => {
@@ -449,6 +453,7 @@ export default function App() {
         scrollYRef.current = 0;
         pendingPrependRef.current = false;
         prependAnchorRef.current = 0;
+        pendingBottomRef.current = true;
         setItems(res.items);
         historyHasMoreRef.current = res.hasMore;
         historyOldestSeqRef.current = res.oldestSeq;
@@ -527,6 +532,7 @@ export default function App() {
     setTokenUsage(null);
     setSidebarOpen(false);
     setReasoningOpen({});
+    setKbHeight(0);
     historyHasMoreRef.current = false;
     historyOldestSeqRef.current = undefined;
     loadingOlderRef.current = false;
@@ -534,6 +540,7 @@ export default function App() {
     scrollYRef.current = 0;
     pendingPrependRef.current = false;
     prependAnchorRef.current = 0;
+    pendingBottomRef.current = true;
     const res = await loadHistory(c, sid);
     setItems(res.items);
     historyHasMoreRef.current = res.hasMore;
@@ -561,6 +568,8 @@ export default function App() {
       scrollYRef.current = 0;
       pendingPrependRef.current = false;
       prependAnchorRef.current = 0;
+      pendingBottomRef.current = true;
+      setKbHeight(0);
       setBusy(false);
       setSidebarOpen(false);
       refreshLists();
@@ -842,9 +851,16 @@ export default function App() {
   useEffect(() => {
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
     const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
-    const s1 = Keyboard.addListener(showEvent, (e: any) => setKbHeight(e.endCoordinates?.height ?? 0));
-    const s2 = Keyboard.addListener(hideEvent, () => setKbHeight(0));
-    return () => { s1.remove(); s2.remove(); };
+    const subs = [
+      Keyboard.addListener(showEvent, (e: any) => setKbHeight(e.endCoordinates?.height ?? 0)),
+      Keyboard.addListener(hideEvent, () => setKbHeight(0)),
+    ];
+    // 双保险：某些机型/场景只发 will* 或 did*，漏掉任何一个都会残留底部空白
+    if (Platform.OS !== 'ios') {
+      subs.push(Keyboard.addListener('keyboardWillHide' as any, () => setKbHeight(0)));
+      subs.push(Keyboard.addListener('keyboardWillShow' as any, (e: any) => setKbHeight(e?.endCoordinates?.height ?? 0)));
+    }
+    return () => { for (const s of subs) s.remove(); };
   }, []);
 
   return (
@@ -892,6 +908,11 @@ export default function App() {
             style={styles.list}
             data={items}
             keyExtractor={(m) => m.id}
+            // Android 上 removeClippedSubviews 默认开启，会分离离屏子视图，
+            // 在变高列表里容易出现「大段空白」；关掉更稳。
+            removeClippedSubviews={false}
+            // 内容短于视口时贴底显示（跟电脑端一致），不再在最后一条下面留大段空白
+            contentContainerStyle={items.length > 0 ? styles.listContent : styles.listContentEmpty}
             onContentSizeChange={(_w: number, h: number) => {
               const prevHeight = contentHeightRef.current;
               contentHeightRef.current = h;
@@ -909,14 +930,23 @@ export default function App() {
                 }
                 return;
               }
-              // 只有用户停留在底部时才自动跟随新内容；上滑回看历史时不要强行拽回底部
-              if (isAtBottomRef.current) listRef.current?.scrollToEnd({ animated: false });
+              // 打开/切换会话后强制落底；之后只有用户停留在底部时才自动跟随新内容
+              if (pendingBottomRef.current || isAtBottomRef.current) {
+                listRef.current?.scrollToEnd({ animated: false });
+              }
+            }}
+            onScrollBeginDrag={() => {
+              // 用户开始手动拖动：交还滚动控制权
+              pendingBottomRef.current = false;
             }}
             onScroll={(e: NativeSyntheticEvent<NativeScrollEvent>) => {
               const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
               scrollYRef.current = contentOffset.y;
               const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
-              isAtBottomRef.current = distanceFromBottom < 40;
+              const atBottom = distanceFromBottom < 40;
+              isAtBottomRef.current = atBottom;
+              // 已经真正落到底：强制标记完成使命
+              if (atBottom && pendingBottomRef.current && distanceFromBottom >= 0) pendingBottomRef.current = false;
               // 滑到顶部时加载更早的一页历史（可与电脑完全同步到第一条）
               if (contentOffset.y < 60) loadOlder();
             }}
@@ -1436,7 +1466,11 @@ const styles = StyleSheet.create({
   status: { fontSize: 12, color: '#666', marginTop: 2 },
   gear: { width: 40, alignItems: 'center' },
   gearText: { fontSize: 20, color: '#3964fe' },
-  list: { flex: 1, padding: 12 },
+  list: { flex: 1 },
+  // 内容内边距放在 contentContainerStyle（style 上的 padding 在 Android 会裁切内容）；
+  // flexGrow + justifyContent 让「内容短于视口」时消息贴底显示，最后一条下面不留空白。
+  listContent: { padding: 12, flexGrow: 1, justifyContent: 'flex-end' },
+  listContentEmpty: { padding: 12, flexGrow: 1 },
   bubble: { maxWidth: '86%', padding: 10, borderRadius: 14, marginVertical: 4 },
   userBubble: { alignSelf: 'flex-end', backgroundColor: '#3964fe' },
   assistantBubble: { alignSelf: 'flex-start', backgroundColor: '#fff' },
