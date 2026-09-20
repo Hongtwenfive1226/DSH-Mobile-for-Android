@@ -2,6 +2,26 @@
 
 本项目的版本号（`versionCode` / `versionName`）与 APK 的 Android 版本信息一致。所有版本均可通过文件桥或 GitHub Release 下载。
 
+## v1.11（versionCode 12）— 2026-09-20
+
+**改用反转列表（inverted）——从根上消除底部空白与滚不到底**
+
+前几版一直在「按内容高度算滚动位置」（`scrollToEnd` / `scrollToOffset` 补偿 / `maintainVisibleContentPosition`），
+但**虚拟化列表的内容高度并不可靠**：一旦算错就会落进尚未渲染的区域，表现就是
+「反复切换会话后出现大段空白 / 滚不到底」。这一版换成聊天列表的标准架构：
+
+- ♻️ `inverted` 反转列表：`data` 为「最新在前」，**滚动偏移 0 就是最新一条**。
+  - 打开/切换会话**天然**落在最新一条 —— 不再需要 `scrollToEnd`，也不依赖内容高度，竞态消失；
+  - 上滑加载更早历史 = 追加到反转数据末尾（视觉上方），**视口不会移动**，
+    因此彻底删除了 prepend 位置补偿逻辑；
+  - 内容天然贴底，最后一条下面不会再有空白。
+- 🧹 移除全部脆弱逻辑：`onContentSizeChange` 补偿、`pendingPrependRef`/`prependAnchorRef`/
+  `contentHeightRef`/`pendingBottomRef`/`scrollYRef`、`maintainVisibleContentPosition`。
+- ⚙️ 配套：`removeClippedSubviews={false}`（Android 上 inverted 与裁剪同开会空白）、
+  `ListEmptyComponent` 不手动翻转（RN 已自动反向翻转，手翻会导致文字颠倒）。
+- ✨ 顺带改进：会话历史加载中显示「正在加载对话…」，失败显示原因 + **重试按钮**，
+  不再让「还在加载/加载失败」看起来像整片空白；发送消息后自动回到最新一条。
+
 ## v1.10（versionCode 11）— 2026-09-20
 
 **底部空白与「切会话后滚不到底」修复**

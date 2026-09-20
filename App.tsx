@@ -1,5 +1,5 @@
 // App.tsx — DSH Mobile v3：侧边栏 + 工作区 + 设置 + 持久化 + 工具卡片 + 审批 + 会话/工作区管理
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -153,9 +153,12 @@ function minEventSeq(events: HistoryEntry[]): number | undefined {
   return min === Infinity ? undefined : min;
 }
 
-async function loadHistory(client: DshClient, sessionId: string): Promise<{ items: ChatItem[]; tokenUsage: any | null; hasMore: boolean; oldestSeq: number | undefined }> {
+async function loadHistory(client: DshClient, sessionId: string): Promise<{ items: ChatItem[]; tokenUsage: any | null; hasMore: boolean; oldestSeq: number | undefined; error?: string }> {
   const r = await client.history(sessionId);
-  if (!r.ok) return { items: [], tokenUsage: null, hasMore: false, oldestSeq: undefined };
+  if (!r.ok) {
+    const msg = r.error?.code === 'session-not-found' ? '会话不存在' : `加载失败(${r.error?.code ?? 'unknown'})`;
+    return { items: [], tokenUsage: null, hasMore: false, oldestSeq: undefined, error: r.error?.message ?? msg };
+  }
   const items = parseHistoryEvents(r.value.events);
   const tokenUsage = (r.value as any)?.projections?.values?.tokenUsage ?? null;
   return { items, tokenUsage, hasMore: r.value.hasMore, oldestSeq: minEventSeq(r.value.events) };
@@ -248,6 +251,9 @@ export default function App() {
   const [kbHeight, setKbHeight] = useState(0);
   const [reasoningOpen, setReasoningOpen] = useState<Record<string, boolean>>({});
   const [loadingOlder, setLoadingOlder] = useState(false);
+  // 会话历史的加载状态：避免「还在加载」被误看成整片空白
+  const [historyStatus, setHistoryStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   // UI
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -273,22 +279,13 @@ export default function App() {
   const streamRef = useRef<{ id: string } | null>(null);
   const stopRef = useRef<(() => void) | null>(null);
   const listRef = useRef<FlatList<ChatItem>>(null);
+  // 反转列表下「是否停在最新一条」，仅用于展示/后续扩展；滚动定位不再依赖它
   const isAtBottomRef = useRef(true);
   const restoreSessionRef = useRef<string | null>(null);
   // 历史分页游标
   const historyHasMoreRef = useRef(false);
   const historyOldestSeqRef = useRef<number | undefined>(undefined);
   const loadingOlderRef = useRef(false);
-  // prepend 更早历史时的滚动位置补偿（替代 maintainVisibleContentPosition，
-  // 后者在 Android 上会保留旧锚点，导致滑到底部时被弹回历史中段）
-  const contentHeightRef = useRef(0);
-  const scrollYRef = useRef(0);
-  const pendingPrependRef = useRef(false);
-  const prependAnchorRef = useRef(0);
-  // 打开/切换会话后强制「落到最新一条」：不依赖 isAtBottomRef，
-  // 避免首帧的 onScroll 把标记冲掉导致停在顶部（表现为无法下滚到底部）。
-  // 用户一旦手动拖动列表即交还控制权（onScrollBeginDrag 清除）。
-  const pendingBottomRef = useRef(false);
 
   // 载入持久化设置
   useEffect(() => {
@@ -449,11 +446,6 @@ export default function App() {
         setActiveSessionId(target.sessionId);
         const res = await loadHistory(client, target.sessionId);
         isAtBottomRef.current = true;
-        contentHeightRef.current = 0;
-        scrollYRef.current = 0;
-        pendingPrependRef.current = false;
-        prependAnchorRef.current = 0;
-        pendingBottomRef.current = true;
         setItems(res.items);
         historyHasMoreRef.current = res.hasMore;
         historyOldestSeqRef.current = res.oldestSeq;
@@ -489,7 +481,9 @@ export default function App() {
     if (s.ok) setSessions(s.value.items);
   }, []);
 
-  // 上滑到顶时加载更早的一页历史（prepend）
+  // 滑到「最旧」一端时加载更早的一页历史
+  // 反转列表下，更早的消息追加到反转数据的末尾（视觉上方），不会移动当前视口，
+  // 因此这里不需要任何滚动位置补偿。
   const loadOlder = useCallback(async () => {
     const c = clientRef.current;
     const sid = sessionRef.current;
@@ -502,13 +496,7 @@ export default function App() {
       if (!r.ok || sessionRef.current !== sid) return;
       const older = parseHistoryEvents(r.value.events);
       const nextOldest = minEventSeq(r.value.events);
-      if (older.length > 0) {
-        // 记录 prepend 前的滚动位置；内容增高后由 onContentSizeChange 补偿，
-        // 使当前阅读位置保持不动（新加载的更早内容留在上方）
-        prependAnchorRef.current = scrollYRef.current;
-        pendingPrependRef.current = true;
-        setItems((prev) => [...older, ...prev]);
-      }
+      if (older.length > 0) setItems((prev) => [...older, ...prev]);
       if (nextOldest !== undefined) historyOldestSeqRef.current = nextOldest;
       historyHasMoreRef.current = r.value.hasMore;
     } finally {
@@ -536,16 +524,19 @@ export default function App() {
     historyHasMoreRef.current = false;
     historyOldestSeqRef.current = undefined;
     loadingOlderRef.current = false;
-    contentHeightRef.current = 0;
-    scrollYRef.current = 0;
-    pendingPrependRef.current = false;
-    prependAnchorRef.current = 0;
-    pendingBottomRef.current = true;
+    setHistoryStatus('loading');
+    setHistoryError(null);
     const res = await loadHistory(c, sid);
     setItems(res.items);
     historyHasMoreRef.current = res.hasMore;
     historyOldestSeqRef.current = res.oldestSeq;
     if (res.tokenUsage) setTokenUsage(res.tokenUsage);
+    if (res.error) {
+      setHistoryError(res.error);
+      setHistoryStatus('error');
+    } else {
+      setHistoryStatus('ready');
+    }
   }, []);
 
   const createNewSession = useCallback(async () => {
@@ -564,11 +555,8 @@ export default function App() {
       historyHasMoreRef.current = false;
       historyOldestSeqRef.current = undefined;
       loadingOlderRef.current = false;
-      contentHeightRef.current = 0;
-      scrollYRef.current = 0;
-      pendingPrependRef.current = false;
-      prependAnchorRef.current = 0;
-      pendingBottomRef.current = true;
+      setHistoryStatus('ready');
+      setHistoryError(null);
       setKbHeight(0);
       setBusy(false);
       setSidebarOpen(false);
@@ -586,6 +574,8 @@ export default function App() {
     setInput('');
     setBusy(true);
     setItems((prev) => [...prev, { kind: 'msg', id: `u-${Date.now()}`, role: 'user', text }]);
+    // 反转列表下偏移 0 即最新一条：发消息后主动回到最新（用户此前可能在上滑回看）
+    requestAnimationFrame(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }));
     try {
       const r = await c.prompt({ sessionId: sid, mode: 'queue', content: [{ type: 'text', text }] });
       if (!r.ok) {
@@ -863,6 +853,9 @@ export default function App() {
     return () => { for (const s of subs) s.remove(); };
   }, []);
 
+  // 反转列表数据：最新在前（配合 inverted，偏移 0 = 最新一条 = 视觉底部）
+  const listData = useMemo(() => (items.length > 1 ? [...items].reverse() : items), [items]);
+
   return (
     <SafeAreaProvider>
       {/* 最外层兜底：任何未预期的渲染异常都显示成可读的错误面板，而不是整屏白屏 */}
@@ -906,55 +899,32 @@ export default function App() {
           <FlatList
             ref={listRef}
             style={styles.list}
-            data={items}
+            // 反转列表：data 为「最新在前」，滚动偏移 0 就是最新一条（视觉底部）。
+            // 好处：打开/切换会话天然落在最新一条，完全不需要 scrollToEnd，
+            // 也不依赖虚拟化下并不可靠的内容高度计算 —— 这正是反复切换会话后
+            // 出现「大段空白 / 滚不到底」的根因（落到未渲染区域）。
+            data={listData}
+            inverted
             keyExtractor={(m) => m.id}
-            // Android 上 removeClippedSubviews 默认开启，会分离离屏子视图，
-            // 在变高列表里容易出现「大段空白」；关掉更稳。
+            // Android 上 inverted 与 removeClippedSubviews 同时开启会造成空白，必须关闭
             removeClippedSubviews={false}
-            // 内容短于视口时贴底显示（跟电脑端一致），不再在最后一条下面留大段空白
             contentContainerStyle={items.length > 0 ? styles.listContent : styles.listContentEmpty}
-            onContentSizeChange={(_w: number, h: number) => {
-              const prevHeight = contentHeightRef.current;
-              contentHeightRef.current = h;
-              // prepend 更早历史使内容从顶部增高：等量补偿滚动位置，
-              // 让当前阅读位置保持不动（不用 maintainVisibleContentPosition，
-              // 那个原生实现会保留旧锚点，导致滑到底部时被弹回历史中段）
-              if (pendingPrependRef.current) {
-                pendingPrependRef.current = false;
-                const delta = h - prevHeight;
-                if (delta > 0) {
-                  listRef.current?.scrollToOffset({
-                    offset: Math.max(0, prependAnchorRef.current + delta),
-                    animated: false,
-                  });
-                }
-                return;
-              }
-              // 打开/切换会话后强制落底；之后只有用户停留在底部时才自动跟随新内容
-              if (pendingBottomRef.current || isAtBottomRef.current) {
-                listRef.current?.scrollToEnd({ animated: false });
-              }
-            }}
-            onScrollBeginDrag={() => {
-              // 用户开始手动拖动：交还滚动控制权
-              pendingBottomRef.current = false;
-            }}
             onScroll={(e: NativeSyntheticEvent<NativeScrollEvent>) => {
               const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
-              scrollYRef.current = contentOffset.y;
-              const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
-              const atBottom = distanceFromBottom < 40;
-              isAtBottomRef.current = atBottom;
-              // 已经真正落到底：强制标记完成使命
-              if (atBottom && pendingBottomRef.current && distanceFromBottom >= 0) pendingBottomRef.current = false;
-              // 滑到顶部时加载更早的一页历史（可与电脑完全同步到第一条）
-              if (contentOffset.y < 60) loadOlder();
+              // 反转列表：offset 0 = 最新（视觉底部）
+              isAtBottomRef.current = contentOffset.y < 40;
+              // 滑到另一端（最旧）时加载更早的一页历史
+              if (contentOffset.y + layoutMeasurement.height >= contentSize.height - 80 && contentSize.height > layoutMeasurement.height + 40) {
+                loadOlder();
+              }
             }}
             onScrollEndDrag={(e) => {
-              if (e.nativeEvent.contentOffset.y < 60) loadOlder();
+              const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
+              if (contentOffset.y + layoutMeasurement.height >= contentSize.height - 80) loadOlder();
             }}
             onMomentumScrollEnd={(e) => {
-              if (e.nativeEvent.contentOffset.y < 60) loadOlder();
+              const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
+              if (contentOffset.y + layoutMeasurement.height >= contentSize.height - 80) loadOlder();
             }}
             scrollEventThrottle={16}
             renderItem={({ item }) =>
@@ -1015,10 +985,32 @@ export default function App() {
               )
             }
             ListEmptyComponent={
+              // 注意：inverted 时 RN 会自动给 ListEmptyComponent 套 inversionStyle 反向翻转
+              // （VirtualizedList.js 的 _renderEmptyComponent），这里不要再手动翻转，否则文字上下颠倒。
               <View style={styles.empty}>
-                <Text style={styles.emptyText}>
-                  {activeSessionId ? '开始对话吧' : '还没有会话，点左上角 ☰ 新建一个'}
-                </Text>
+                {historyStatus === 'loading' ? (
+                  <>
+                    <ActivityIndicator size="small" color="#3964fe" />
+                    <Text style={styles.emptyText}>正在加载对话…</Text>
+                  </>
+                ) : historyStatus === 'error' ? (
+                  <>
+                    <Text style={[styles.emptyText, styles.emptyError]}>加载失败：{historyError}</Text>
+                    <TouchableOpacity
+                      style={styles.retryBtn}
+                      onPress={() => {
+                        const sid = sessionRef.current;
+                        if (sid) void openSession(sid);
+                      }}
+                    >
+                      <Text style={styles.retryBtnText}>重试</Text>
+                    </TouchableOpacity>
+                  </>
+                ) : (
+                  <Text style={styles.emptyText}>
+                    {activeSessionId ? '开始对话吧' : '还没有会话，点左上角 ☰ 新建一个'}
+                  </Text>
+                )}
               </View>
             }
           />
@@ -1467,10 +1459,11 @@ const styles = StyleSheet.create({
   gear: { width: 40, alignItems: 'center' },
   gearText: { fontSize: 20, color: '#3964fe' },
   list: { flex: 1 },
-  // 内容内边距放在 contentContainerStyle（style 上的 padding 在 Android 会裁切内容）；
-  // flexGrow + justifyContent 让「内容短于视口」时消息贴底显示，最后一条下面不留空白。
-  listContent: { padding: 12, flexGrow: 1, justifyContent: 'flex-end' },
-  listContentEmpty: { padding: 12, flexGrow: 1 },
+  // 内容内边距放在 contentContainerStyle（style 上的 padding 在 Android 会裁切内容）。
+  // 反转列表下内容天然贴底，因此不需要 flexGrow/justifyContent 做贴底对齐。
+  listContent: { padding: 12 },
+  // 空列表时把提示推到视觉顶部（inverted 下 flex-end 映射到视觉上方）
+  listContentEmpty: { padding: 12, flexGrow: 1, justifyContent: 'flex-end' },
   bubble: { maxWidth: '86%', padding: 10, borderRadius: 14, marginVertical: 4 },
   userBubble: { alignSelf: 'flex-end', backgroundColor: '#3964fe' },
   assistantBubble: { alignSelf: 'flex-start', backgroundColor: '#fff' },
@@ -1511,6 +1504,9 @@ const styles = StyleSheet.create({
   toolResultError: { color: '#c0392b' },
   empty: { alignItems: 'center', marginTop: 60 },
   emptyText: { color: '#999', fontSize: 14 },
+  emptyError: { color: '#c0392b', textAlign: 'center', marginBottom: 10, paddingHorizontal: 20 },
+  retryBtn: { backgroundColor: '#3964fe', borderRadius: 8, paddingVertical: 8, paddingHorizontal: 20 },
+  retryBtnText: { color: '#fff', fontWeight: '600' },
   inputRow: { flexDirection: 'row', padding: 8, backgroundColor: '#fff' },
   input: {
     flex: 1,
