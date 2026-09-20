@@ -7,10 +7,10 @@ import {
   Modal,
   NativeScrollEvent,
   NativeSyntheticEvent,
+  LayoutChangeEvent,
   Platform,
   ScrollView,
   Share,
-  StatusBar,
   StyleSheet,
   Text,
   TextInput,
@@ -52,7 +52,7 @@ interface ImageRef {
   mediaType: string;
 }
 
-type ChatItem =
+export type ChatItem =
   | { kind: 'msg'; id: string; role: 'user' | 'assistant'; text: string; reasoning?: string; streaming?: boolean; images?: ImageRef[] }
   | { kind: 'tool'; id: string; name: string; args: string; result?: string; isError?: boolean; done: boolean };
 
@@ -71,12 +71,26 @@ interface PendingQuestion {
   questions: AskUserQuestion[];
 }
 
+// 单条工具参数/结果最多渲染的字符数。
+// numberOfLines 只影响「显示几行」，文本节点仍要整段参与 Android 的排版与绘制，
+// 实测真实会话里有 2.5 万字的 args、6.5 万字的结果 —— 先截断再渲染，避免超长文本节点。
+const MAX_ARGS_CHARS = 800;
+const MAX_RESULT_CHARS = 4000;
+// 关闭虚拟化后所有已加载消息都真实挂载，因此给「一次会话里最多保留多少条」设一个上限，
+// 避免一直往前翻把内存和渲染量堆到卡顿。到顶后停止加载（不裁剪已显示内容，避免视口跳动）。
+const MAX_LOADED_ITEMS = 300;
+
+function clipText(s: string, max: number): string {
+  if (typeof s !== 'string' || s.length <= max) return s;
+  return `${s.slice(0, max)}\n…（共 ${s.length} 字，已截断）`;
+}
+
 function extractText(content: any): string {
   if (!Array.isArray(content)) return '';
   return content
     .filter((b: any) => b?.type === 'text' && typeof b.text === 'string')
     .map((b: any) => b.text)
-    .join('');
+    .join('\n\n');
 }
 
 function extractImageRefs(content: any): ImageRef[] {
@@ -110,7 +124,7 @@ function extractToolResult(data: any): { text: string; isError: boolean } {
 }
 
 // 把一页历史事件解析成聊天条目（顺序不变，升序）
-function parseHistoryEvents(events: HistoryEntry[]): ChatItem[] {
+export function parseHistoryEvents(events: HistoryEntry[]): ChatItem[] {
   const out: ChatItem[] = [];
   for (const entry of events) {
     const ev = entry.event;
@@ -118,28 +132,31 @@ function parseHistoryEvents(events: HistoryEntry[]): ChatItem[] {
       const content = ev.data?.content ?? ev.data?.message?.content;
       const text = extractText(content);
       const images = extractImageRefs(content);
-      if (text || images.length) out.push({ kind: 'msg', id: `u-${ev.seq}`, role: 'user', text, images: images.length ? images : undefined });
+      if (text.trim() || images.length) out.push({ kind: 'msg', id: `u-${ev.seq}`, role: 'user', text, images: images.length ? images : undefined });
     } else if (ev.type === 'assistant/message') {
       const content = ev.data?.message?.content;
-      const text = extractText(content);
+      // 只有空白的 text 不参与渲染：Markdown 解析后是空节点，只会留下一个空气泡（视觉上就是空白）
+      const raw = extractText(content);
+      const text = raw.trim() ? raw : '';
       const reasoning = extractReasoning(content);
       const images = extractImageRefs(content);
       if (text || reasoning || images.length) out.push({ kind: 'msg', id: `a-${ev.seq}`, role: 'assistant', text, reasoning: reasoning || undefined, images: images.length ? images : undefined });
     } else if (ev.type === 'tool/call') {
       const d = ev.data;
-      out.push({ kind: 'tool', id: `t-${d.callId}`, name: d.name, args: d.arguments ?? '', done: false });
+      out.push({ kind: 'tool', id: `t-${d.callId}`, name: d.name ?? '工具', args: clipText(d.arguments ?? '', MAX_ARGS_CHARS), done: false });
     } else if (ev.type === 'tool/result') {
       const d = ev.data;
       const { text, isError } = extractToolResult(d);
       const callId = d?.message?.content?.[0]?.toolCallId;
       const id = `t-${callId ?? ev.seq}`;
+      const clipped = clipText(text, MAX_RESULT_CHARS);
       const item = out.find((x) => x.kind === 'tool' && x.id === id);
       if (item && item.kind === 'tool') {
-        item.result = text;
+        item.result = clipped;
         item.isError = isError;
         item.done = true;
       } else {
-        out.push({ kind: 'tool', id, name: '工具', args: '', result: text, isError, done: true });
+        out.push({ kind: 'tool', id, name: '工具', args: '', result: clipped, isError, done: true });
       }
     }
   }
@@ -212,6 +229,110 @@ async function downloadFile(baseUrl: string, hostPath: string): Promise<{ name: 
   return res.json();
 }
 
+/* ------------------------- 单条消息行（memo 化） ------------------------- */
+// 关闭虚拟化后，所有已加载的消息都真实挂载；如果每次流式增量（每个 chunk 都会 setItems）
+// 都重建整棵列表，长会话会明显卡顿（表现出来同样是「一片空白 / 没反应」）。
+// 这里把每行做成 React.memo：item 对象在流式更新时保持引用不变（setItems 只 map 命中的那一条），
+// 回调都是 useCallback 稳定的，所以未变化的消息整棵子树直接跳过。
+interface MessageRowProps {
+  item: ChatItem;
+  reasoningOpen: boolean;
+  onToggleReasoning: (id: string) => void;
+  onPath: (p: string) => void;
+  onImage: (attachmentId: string, mediaType: string) => void;
+  /** 设置里打开的排查开关：显示每条消息的下标 / id / 实测高度 */
+  debug?: boolean;
+  index?: number;
+}
+
+export const MessageRow = React.memo(function MessageRowImpl({
+  item,
+  reasoningOpen: open,
+  onToggleReasoning,
+  onPath,
+  onImage,
+  debug,
+  index,
+}: MessageRowProps) {
+  // 只在排查开关打开时才记录高度，正常使用不产生任何额外状态更新
+  const [measured, setMeasured] = useState<number | null>(null);
+  const onLayout = debug
+    ? (e: LayoutChangeEvent) => {
+        const h = Math.round(e.nativeEvent.layout.height);
+        setMeasured((prev) => (prev === h ? prev : h));
+      }
+    : undefined;
+  const badge = debug ? (
+    <Text style={styles.debugBadge}>
+      #{index} {item.id} {item.kind === 'tool' ? 'tool' : item.role} h={measured ?? '?'}{' '}
+      {item.kind === 'tool' ? `args=${item.args.length} res=${item.result?.length ?? 0}` : `text=${item.text.length} reasoning=${item.reasoning?.length ?? 0}`}
+    </Text>
+  ) : null;
+  if (item.kind !== 'msg') {
+    return (
+      <View onLayout={onLayout}>
+        {badge}
+        <View style={styles.toolCard}>
+          <View style={styles.toolHeader}>
+            <Text style={styles.toolName}>
+              {item.done ? (item.isError ? '✗ ' : '✓ ') : '⏳ '}
+              {item.name}
+            </Text>
+            {!item.done && <ActivityIndicator size="small" color="#3964fe" />}
+          </View>
+          {item.args ? (
+            <Text style={styles.toolArgs} numberOfLines={3}>
+              {item.args}
+            </Text>
+          ) : null}
+          {item.done && item.result ? (
+            <Text style={[styles.toolResult, item.isError && styles.toolResultError]} numberOfLines={6}>
+              {item.result}
+            </Text>
+          ) : null}
+        </View>
+      </View>
+    );
+  }
+  return (
+    <View onLayout={onLayout}>
+      {badge}
+      <View style={[styles.bubble, item.role === 'user' ? styles.userBubble : styles.assistantBubble]}>
+      {item.role === 'assistant' && item.reasoning ? (
+        <View style={styles.reasoningWrap}>
+          <TouchableOpacity style={styles.reasoningToggle} onPress={() => onToggleReasoning(item.id)}>
+            <Text style={styles.reasoningToggleText}>💭 思维链 {open ? '▾' : '▸'}</Text>
+          </TouchableOpacity>
+          {open ? (
+            <Text style={styles.reasoningText}>
+              {item.reasoning}
+              {item.streaming ? '▍' : ''}
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
+      {item.role === 'assistant' ? (
+        item.text ? (
+          <Markdown text={item.streaming ? `${item.text} ▍` : item.text} onPath={onPath} />
+        ) : item.streaming ? (
+          <Text style={styles.bubbleText}>▍</Text>
+        ) : null
+      ) : (
+        <Text style={[styles.bubbleText, styles.userText]}>
+          {renderPathText(item.text, onPath)}
+          {item.streaming ? '▍' : ''}
+        </Text>
+      )}
+      {item.images?.map((im, i) => (
+        <TouchableOpacity key={i} style={styles.imageDownloadBtn} onPress={() => onImage(im.attachmentId, im.mediaType)}>
+          <Text style={styles.imageDownloadText}>🖼 下载图片</Text>
+        </TouchableOpacity>
+      ))}
+      </View>
+    </View>
+  );
+});
+
 // 纯黑色回形针矢量图标（Material Design attach_file 路径）
 function PaperclipIcon({ size = 22, color = '#000' }: { size?: number; color?: string }) {
   return (
@@ -273,6 +394,9 @@ export default function App() {
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [downloadPath, setDownloadPath] = useState('');
   const [modeOpen, setModeOpen] = useState(false);
+  // 排查开关：在每条消息上方显示「下标 / 事件 id / 实测高度 / 字数」。
+  // 万一还看到空白，打开它截图就能直接指认是哪一条（id 就是会话日志里的事件 seq）。
+  const [layoutDebug, setLayoutDebug] = useState(false);
 
   const clientRef = useRef<DshClient | null>(null);
   const sessionRef = useRef<string | null>(null);
@@ -286,6 +410,12 @@ export default function App() {
   const historyHasMoreRef = useRef(false);
   const historyOldestSeqRef = useRef<number | undefined>(undefined);
   const loadingOlderRef = useRef(false);
+  // 已加载条数（给 loadOlder 的上限判断用，避免把 items 塞进 useCallback 依赖）
+  const itemsCountRef = useRef(0);
+
+  useEffect(() => {
+    itemsCountRef.current = items.length;
+  }, [items]);
 
   // 载入持久化设置
   useEffect(() => {
@@ -301,6 +431,7 @@ export default function App() {
           if (typeof s.selectedPreset === 'string') setSelectedPreset(s.selectedPreset);
           if (typeof s.activeWorkspaceId === 'string') setActiveWorkspaceId(s.activeWorkspaceId);
           if (typeof s.activeSessionId === 'string') restoreSessionRef.current = s.activeSessionId;
+          if (s.layoutDebug === true) setLayoutDebug(true);
         }
       } catch {}
       setHydrated(true);
@@ -312,9 +443,9 @@ export default function App() {
     if (!hydrated) return;
     AsyncStorage.setItem(
       STORE_KEY,
-      JSON.stringify({ serverUrl: appliedUrl, selectedPreset, activeWorkspaceId, activeSessionId }),
+      JSON.stringify({ serverUrl: appliedUrl, selectedPreset, activeWorkspaceId, activeSessionId, layoutDebug }),
     ).catch(() => {});
-  }, [hydrated, appliedUrl, selectedPreset, activeWorkspaceId, activeSessionId]);
+  }, [hydrated, appliedUrl, selectedPreset, activeWorkspaceId, activeSessionId, layoutDebug]);
 
   // 连接 / 重连
   useEffect(() => {
@@ -489,6 +620,7 @@ export default function App() {
     const sid = sessionRef.current;
     if (!c || !sid) return;
     if (loadingOlderRef.current || !historyHasMoreRef.current) return;
+    if (itemsCountRef.current >= MAX_LOADED_ITEMS) return;
     loadingOlderRef.current = true;
     setLoadingOlder(true);
     try {
@@ -900,14 +1032,25 @@ export default function App() {
             ref={listRef}
             style={styles.list}
             // 反转列表：data 为「最新在前」，滚动偏移 0 就是最新一条（视觉底部）。
-            // 好处：打开/切换会话天然落在最新一条，完全不需要 scrollToEnd，
-            // 也不依赖虚拟化下并不可靠的内容高度计算 —— 这正是反复切换会话后
-            // 出现「大段空白 / 滚不到底」的根因（落到未渲染区域）。
+            // 好处：打开/切换会话天然落在最新一条，不需要 scrollToEnd，
+            // 也不依赖内容高度做滚动补偿。
             data={listData}
             inverted
             keyExtractor={(m) => m.id}
             // Android 上 inverted 与 removeClippedSubviews 同时开启会造成空白，必须关闭
             removeClippedSubviews={false}
+            // 【大段空白的真正根因】虚拟化列表在没有 getItemLayout 时，把「渲染窗口之外」
+            // 的消息用**平均高度估算**的 spacer 占位（@react-native/virtualized-lists/
+            // VirtualizedList.js:1045 `spacerSize`），而且窗口可以不含下标 0；
+            // 反转列表的「家」正好是 offset 0 处的内容坐标 0..V —— 也就是下标 0 那一段。
+            // 一旦窗口滑走，offset 0 看到的就是这个 spacer：一片什么都没有的空白，
+            // 而且它就在滚动范围的最小端，再怎么滑也滑不出内容来（=「滚不到底」）。
+            // 聊天页每页只有 50 条，直接关掉虚拟化：窗口永远从 0 开始
+            // （VirtualizedList.js:634 `first: 0`），也不再有 spacer（:1020），
+            // 每条消息都是真实布局，空白这类问题从结构上不再可能发生。
+            disableVirtualization
+            initialNumToRender={Math.max(items.length, 1)}
+            maxToRenderPerBatch={Math.max(items.length, 1)}
             contentContainerStyle={items.length > 0 ? styles.listContent : styles.listContentEmpty}
             onScroll={(e: NativeSyntheticEvent<NativeScrollEvent>) => {
               const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
@@ -927,63 +1070,17 @@ export default function App() {
               if (contentOffset.y + layoutMeasurement.height >= contentSize.height - 80) loadOlder();
             }}
             scrollEventThrottle={16}
-            renderItem={({ item }) =>
-              item.kind === 'msg' ? (
-                <View style={[styles.bubble, item.role === 'user' ? styles.userBubble : styles.assistantBubble]}>
-                  {item.role === 'assistant' && item.reasoning ? (
-                    <View style={styles.reasoningWrap}>
-                      <TouchableOpacity style={styles.reasoningToggle} onPress={() => toggleReasoning(item.id)}>
-                        <Text style={styles.reasoningToggleText}>
-                          💭 思维链 {reasoningOpen[item.id] ? '▾' : '▸'}
-                        </Text>
-                      </TouchableOpacity>
-                      {reasoningOpen[item.id] ? (
-                        <Text style={styles.reasoningText}>
-                          {item.reasoning}
-                          {item.streaming ? '▍' : ''}
-                        </Text>
-                      ) : null}
-                    </View>
-                  ) : null}
-                  {item.role === 'assistant' ? (
-                    item.text ? (
-                      <Markdown text={item.streaming ? `${item.text} ▍` : item.text} onPath={downloadByPath} />
-                    ) : item.streaming ? (
-                      <Text style={styles.bubbleText}>▍</Text>
-                    ) : null
-                  ) : (
-                    <Text style={[styles.bubbleText, styles.userText]}>
-                      {renderPathText(item.text, downloadByPath)}
-                      {item.streaming ? '▍' : ''}
-                    </Text>
-                  )}
-                  {item.images?.map((im, i) => (
-                    <TouchableOpacity
-                      key={i}
-                      style={styles.imageDownloadBtn}
-                      onPress={() => downloadImage(im.attachmentId, im.mediaType)}
-                    >
-                      <Text style={styles.imageDownloadText}>🖼 下载图片</Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-              ) : (
-                <View style={styles.toolCard}>
-                  <View style={styles.toolHeader}>
-                    <Text style={styles.toolName}>{item.done ? (item.isError ? '✗ ' : '✓ ') : '⏳ '}{item.name}</Text>
-                    {!item.done && <ActivityIndicator size="small" color="#3964fe" />}
-                  </View>
-                  {item.args ? (
-                    <Text style={styles.toolArgs} numberOfLines={3}>{item.args}</Text>
-                  ) : null}
-                  {item.done && item.result ? (
-                    <Text style={[styles.toolResult, item.isError && styles.toolResultError]} numberOfLines={6}>
-                      {item.result}
-                    </Text>
-                  ) : null}
-                </View>
-              )
-            }
+            renderItem={({ item, index }) => (
+              <MessageRow
+                item={item}
+                index={index}
+                debug={layoutDebug}
+                reasoningOpen={!!reasoningOpen[item.id]}
+                onToggleReasoning={toggleReasoning}
+                onPath={downloadByPath}
+                onImage={downloadImage}
+              />
+            )}
             ListEmptyComponent={
               // 注意：inverted 时 RN 会自动给 ListEmptyComponent 套 inversionStyle 反向翻转
               // （VirtualizedList.js 的 _renderEmptyComponent），这里不要再手动翻转，否则文字上下颠倒。
@@ -1060,6 +1157,8 @@ export default function App() {
           presets={presets}
           selectedPreset={selectedPreset}
           onSelectPreset={selectPreset}
+          layoutDebug={layoutDebug}
+          onToggleLayoutDebug={setLayoutDebug}
         />
       )}
 
@@ -1368,6 +1467,8 @@ function SettingsView(props: {
   presets: AgentPresetEntry[];
   selectedPreset: string | null;
   onSelectPreset: (id: string) => void;
+  layoutDebug: boolean;
+  onToggleLayoutDebug: (v: boolean) => void;
 }) {
   const { models, presets, selectedPreset } = props;
   return (
@@ -1397,6 +1498,19 @@ function SettingsView(props: {
             <Text style={styles.applyBtnText}>保存并重连</Text>
           </TouchableOpacity>
         </View>
+
+        <Text style={styles.sectionTitle}>排查（消息列表）</Text>
+        <TouchableOpacity
+          style={[styles.optRow, props.layoutDebug && styles.optRowActive]}
+          onPress={() => props.onToggleLayoutDebug(!props.layoutDebug)}
+        >
+          <Text style={styles.optRowText}>
+            显示每条消息的布局信息{props.layoutDebug ? '（已打开）' : '（关闭）'}
+            {'\n'}
+            <Text style={styles.optRowHint}>下标 / 事件 id / 实测高度 / 字数 —— 看到空白时打开它截图</Text>
+          </Text>
+          {props.layoutDebug && <Text style={styles.optCheck}>✓</Text>}
+        </TouchableOpacity>
 
         <Text style={styles.sectionTitle}>Agent 预设（新建会话时生效）</Text>
         {presets.map((p) => (
@@ -1593,6 +1707,16 @@ const styles = StyleSheet.create({
   },
   optRowActive: { backgroundColor: '#eef2ff' },
   optRowText: { fontSize: 14, color: '#111', flex: 1 },
+  optRowHint: { fontSize: 11, color: '#777' },
+  debugBadge: {
+    fontSize: 10,
+    color: '#8a6d00',
+    backgroundColor: '#fff8dc',
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    alignSelf: 'flex-start',
+    marginTop: 2,
+  },
   optCheck: { fontSize: 14, color: '#3964fe', fontWeight: '700' },
   centerOverlay: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.4)', padding: 24 },
   approvalCard: { width: '90%', backgroundColor: '#fff', borderRadius: 14, padding: 20 },
