@@ -166,7 +166,8 @@ function CodeBlock({ code, lang }: { code: string; lang: string }) {
   return (
     <View style={styles.codeBlock}>
       {lang ? <Text style={styles.codeLang}>{lang}</Text> : null}
-      <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+      {/* flexGrow:0 抵消 ScrollView 自带的基础样式，避免它在自适应父级里纵向撑开 */}
+      <ScrollView horizontal style={styles.codeScroll} showsHorizontalScrollIndicator={false}>
         <Text style={styles.codeText}>{code.replace(/\n$/, '')}</Text>
       </ScrollView>
     </View>
@@ -384,7 +385,7 @@ const Markdown = React.memo(function Markdown({ text, onPath }: MarkdownProps) {
   if (nodes === null) return <Text style={styles.para}>{text}</Text>;
   return (
     <MarkdownBoundary text={text}>
-      <View>{nodes}</View>
+      <View style={styles.root}>{nodes}</View>
     </MarkdownBoundary>
   );
 });
@@ -394,6 +395,8 @@ export default Markdown;
 const MONO = 'monospace';
 
 const styles = StyleSheet.create({
+  // 根容器占满气泡宽度：篇幅宽的块（表格/代码/引用）才有确定的宽度可分配
+  root: { alignSelf: 'stretch' },
   para: { fontSize: 15, lineHeight: 22, color: '#111' },
   h1: { fontSize: 20, lineHeight: 28, fontWeight: '700', color: '#111', marginTop: 8, marginBottom: 4 },
   h2: { fontSize: 18, lineHeight: 26, fontWeight: '700', color: '#111', marginTop: 8, marginBottom: 4 },
@@ -411,6 +414,8 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.05)',
   },
   codeBlock: {
+    // alignSelf:stretch 让代码块占满气泡宽度，避免宽度依赖父级自适应计算
+    alignSelf: 'stretch',
     backgroundColor: '#f5f6f8',
     borderRadius: 8,
     borderWidth: 1,
@@ -420,15 +425,34 @@ const styles = StyleSheet.create({
     marginVertical: 6,
   },
   codeLang: { fontSize: 11, color: '#98a2b3', marginBottom: 4 },
+  codeScroll: { flexGrow: 0 },
   codeText: { fontFamily: MONO, fontSize: 13, lineHeight: 19, color: '#24292f' },
   hr: { height: 1, backgroundColor: '#e3e6ea', marginVertical: 10 },
-  quote: { borderLeftWidth: 3, borderLeftColor: '#d0d5dd', paddingLeft: 10, marginVertical: 6, opacity: 0.9 },
-  listItem: { flexDirection: 'row', marginVertical: 2 },
+  quote: { alignSelf: 'stretch', borderLeftWidth: 3, borderLeftColor: '#d0d5dd', paddingLeft: 10, marginVertical: 6, opacity: 0.9 },
+  listItem: { flexDirection: 'row', marginVertical: 2, alignItems: 'flex-start' },
   listMarker: { fontSize: 15, lineHeight: 22, color: '#111', minWidth: 18 },
-  listItemBody: { flex: 1 },
-  table: { borderWidth: 1, borderColor: '#e3e6ea', borderRadius: 6, marginVertical: 6, overflow: 'hidden' },
+  // 不写 flex:1：flexBasis 0 的子在「宽度自适应」的父级里会塌成 0 宽、文字被裁掉。
+  // flexShrink:1 让正文按内容宽度排布、超出时换行即可。
+  listItemBody: { flexShrink: 1 },
+  table: {
+    alignSelf: 'stretch',
+    borderWidth: 1,
+    borderColor: '#e3e6ea',
+    borderRadius: 6,
+    marginVertical: 6,
+    overflow: 'hidden',
+  },
   tableRow: { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: '#eef0f3' },
   tableHeadRow: { backgroundColor: '#f5f6f8' },
-  tableCell: { flex: 1, paddingHorizontal: 8, paddingVertical: 5, borderRightWidth: 1, borderRightColor: '#eef0f3' },
+  // 用 flexBasis:'auto' 而不是 flex:1 —— 父级宽度不定时不会塌成 0，宽度确定时仍会均分
+  tableCell: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 'auto',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRightWidth: 1,
+    borderRightColor: '#eef0f3',
+  },
   tableCellText: { fontSize: 13, lineHeight: 19, color: '#111' },
 });

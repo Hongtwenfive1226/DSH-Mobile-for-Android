@@ -2,6 +2,21 @@
 
 本项目的版本号（`versionCode` / `versionName`）与 APK 的 Android 版本信息一致。所有版本均可通过文件桥或 GitHub Release 下载。
 
+## v1.12（versionCode 13）— 2026-09-20
+
+**Markdown 布局塌陷修复（宽度分配）**
+
+- 🐛 助手气泡改为**占满可用宽度**（与电脑端一致）。此前是「按内容自适应宽度」，
+  而 Markdown 的表格 / 列表用 `flex` 分配宽度——**`flex: 1` 在宽度不确定的父级里会塌成 0 宽**，
+  文字被 `overflow: hidden` 裁掉，整块变成空白。
+- 🐛 Markdown 内部块改为**不依赖父级宽度**也能正常渲染：
+  - 列表正文 `flex: 1` → `flexShrink: 1`（不再塌成 0）；
+  - 表格单元格 `flex: 1` → `flexGrow/flexShrink/flexBasis:'auto'`（宽度不定时不塌，确定时仍均分）；
+  - 表格 / 代码块 / 引用块加 `alignSelf: 'stretch'` 占满气泡宽度；
+  - 代码块横向 ScrollView 加 `flexGrow: 0`（抵消 ScrollView 自带基础样式，避免纵向撑开）。
+- 说明：已用真实会话数据（284 条助手回复）验证过「塌宽」只在极少数情况下发生，
+  因此**本次修复不一定是用户所见空白的全部原因**，仍需要截图定位。
+
 ## v1.11（versionCode 12）— 2026-09-20
 
 **改用反转列表（inverted）——从根上消除底部空白与滚不到底**

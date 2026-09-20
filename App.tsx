@@ -1466,7 +1466,9 @@ const styles = StyleSheet.create({
   listContentEmpty: { padding: 12, flexGrow: 1, justifyContent: 'flex-end' },
   bubble: { maxWidth: '86%', padding: 10, borderRadius: 14, marginVertical: 4 },
   userBubble: { alignSelf: 'flex-end', backgroundColor: '#3964fe' },
-  assistantBubble: { alignSelf: 'flex-start', backgroundColor: '#fff' },
+  // 助手气泡必须占满可用宽度（与电脑端一致）：Markdown 的表格/列表用了 flex 分配宽度，
+  // 若气泡宽度是「按内容自适应」，flex:1 会塌成 0 宽、文字被裁掉 → 整条消息变空白。
+  assistantBubble: { alignSelf: 'stretch', maxWidth: '100%', backgroundColor: '#fff' },
   bubbleText: { fontSize: 15, lineHeight: 21, color: '#111' },
   userText: { color: '#fff' },
   reasoningWrap: { marginBottom: 6 },
