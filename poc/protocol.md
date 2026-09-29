@@ -1,5 +1,14 @@
 # DeepSeek Harness `/api` 传输协议参考（非浏览器客户端视角）
 
+> **注意：DSH 0.2.0-rc.1 起协议已换代**，本文档描述的是 0.1.x。
+> 0.2.0 的实测契约（endpoint `<namespace>/<method>`、payload `{args:{…}}`、
+> `session/page` 历史分页、`/api/remote.mux` 逻辑流、`$events` + `$events/result` 审批与提问、
+> 浏览器会话 cookie 鉴权）见 [`../CHANGELOG.md`](../CHANGELOG.md) 的 v1.14 条目与
+> App 侧实现 [`../src/dsh/client.ts`](../src/dsh/client.ts)、[`../src/dsh/live.ts`](../src/dsh/live.ts)；
+> 转发器见 [`forwarder.mjs`](forwarder.mjs) 与 [`dsh-session.mjs`](dsh-session.mjs)。
+>
+> 以下内容保留作为 0.1.x 的历史参考。
+
 > 本文从源码实测提取（`@deepseek-ai/dsh-host-apiproxy`、`@deepseek-ai/dsh-client-connection`），
 > 供 React Native 等非浏览器客户端实现连接层时参考。版本对应 `0.1.0-rc.6`。
 

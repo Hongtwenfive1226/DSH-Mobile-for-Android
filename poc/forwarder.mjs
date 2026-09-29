@@ -1,40 +1,88 @@
-// forwarder.mjs — DSH 公网(Tailscale)安全接入转发器（零依赖）
+// forwarder.mjs — DSH 接入转发器（Tailscale 安全接入 + 鉴权 + 文件桥）
 //
-// 背景：DSH web 目前只能绑定 127.0.0.1，且 /api 有 trust-fence（非 loopback Host 一律 403）。
-// 本转发器监听 Tailscale 网卡地址，把 HTTP 与 WebSocket 转发到 127.0.0.1:3080，
-// 并把 Host 头重写为 loopback，使 fence 放行；只绑 Tailscale IP，不暴露给局域网。
+// 背景（DSH 0.2.0-rc.1 起的变化）：
+//   1. DSH 现在是 Electron 桌面版，Web GUI/API 监听 127.0.0.1:<端口>（当前 19387），
+//      不再是 `dsh web` 的 3080。
+//   2. /api 的每个方法与 WebSocket 都要「浏览器会话 cookie」，缺失即 401；
+//      只有 `GET /?token=…` 能换取 cookie，而那个令牌是进程内随机值、外部拿不到。
+//      → 本转发器改用本机凭据里的签名密钥**自己签发** cookie（见 dsh-session.mjs），
+//        对手机侧完全透明：手机仍然只访问 http://<Tailscale IP>:8787。
+//   3. 请求信任栅栏要求 Host 是 loopback 或落在 trustedHosts，因此这里把 Host
+//      重写为上游 authority（loopback），同时它也正好匹配 cookie 的 audience。
 //
-// 额外提供「文件桥」：
+// 文件桥：
 //   POST /files           {name, data(base64)}  → 存到 FILE_ROOT/shared-files/<name>，返回 {path}
 //   GET  /files?path=…    读 FILE_ROOT 内的文件，返回 {name, data(base64)}
+//   GET  /healthz         返回上游状态（端口、鉴权是否就绪）
 //
 // 用法：
-//   node forwarder.mjs                          # 默认监听 YOUR_TAILSCALE_IP:8787
-//   LISTEN_HOST=YOUR_TAILSCALE_IP LISTEN_PORT=8787 FILE_ROOT=/path/to/workspace node forwarder.mjs
-//
-// 安全：仅绑定 LISTEN_HOST（Tailscale IP）；文件读写限制在 FILE_ROOT 范围内。
+//   node forwarder.mjs
+//   LISTEN_HOST=100.103.120.7 LISTEN_PORT=8787 DSH_WEB_PORT=19387 FILE_ROOT=D:\AutoDS node forwarder.mjs
 
 import { createServer, request as httpRequest } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { mintCookie, readBrowserSecret, candidatePorts } from './dsh-session.mjs';
 
-const LISTEN_HOST = process.env.LISTEN_HOST ?? 'YOUR_TAILSCALE_IP';
+const LISTEN_HOST = process.env.LISTEN_HOST ?? '100.103.120.7';
 const LISTEN_PORT = Number(process.env.LISTEN_PORT ?? 8787);
 const UPSTREAM_HOST = '127.0.0.1';
-const UPSTREAM_PORT = 3080;
-const UPSTREAM_AUTHORITY = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
-const FILE_ROOT = process.env.FILE_ROOT ?? (process.platform === 'win32' ? 'D:\\your-workspace' : '/home/user/workspace');
+const FILE_ROOT = process.env.FILE_ROOT ?? 'D:\\AutoDS';
 const INBOX_DIR = path.join(FILE_ROOT, 'shared-files');
 const MAX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
 
 const ts = () => new Date().toISOString().slice(11, 19);
 const log = (...a) => console.log(`[${ts()}]`, ...a);
 
-// 关键：把 Host 头重写为 loopback，并抹掉浏览器标记(Origin/Sec-Fetch-*)，
-// 统一按"无标记客户端"处理，让 DSH 的 /api trust-fence 对手机浏览器和原生 App 都放行。
-function rewriteHeaders(headers) {
+// ---------------------------------------------------------------- 上游与鉴权
+let upstreamPort = Number(process.env.DSH_WEB_PORT ?? 0) || undefined;
+let authority = upstreamPort ? `${UPSTREAM_HOST}:${upstreamPort}` : undefined;
+let cookieHeader; // 当前可用的会话 cookie
+
+function refreshCookie() {
+  if (!authority) throw new Error('upstream authority unknown');
+  cookieHeader = mintCookie(authority).header;
+  return cookieHeader;
+}
+
+/** 探测上游端口：候选端口上能通过鉴权拿到 200 的就算命中 */
+async function discoverUpstream() {
+  const ports = upstreamPort ? [upstreamPort] : candidatePorts();
+  const secret = readBrowserSecret(); // 先确认凭据可用，否则直接报错退出
+  for (const port of ports) {
+    const auth = `${UPSTREAM_HOST}:${port}`;
+    const cookie = mintCookie(auth, { secret }).header;
+    const ok = await probe(auth, cookie);
+    if (ok) {
+      upstreamPort = port;
+      authority = auth;
+      cookieHeader = cookie;
+      return auth;
+    }
+  }
+  return undefined;
+}
+
+function probe(auth, cookie) {
+  const body = JSON.stringify({ type: 'client-request', rpcId: 'forwarder-probe', method: 'session/list', payload: { args: { _request: {} } } });
+  return new Promise((resolve) => {
+    const req = httpRequest(
+      { host: UPSTREAM_HOST, port: Number(auth.split(':')[1]), method: 'POST', path: '/api/session/list', headers: { host: auth, cookie, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      },
+    );
+    req.on('error', () => resolve(false));
+    req.setTimeout(4000, () => req.destroy(new Error('timeout')));
+    req.end(body);
+  });
+}
+
+/** 统一的请求头：抹掉浏览器标记、Host 固定为上游 authority，并带上会话 cookie */
+function upstreamHeaders(headers, { withCookie = true } = {}) {
   const out = { ...headers };
-  out.host = UPSTREAM_AUTHORITY;
+  out.host = authority;
   delete out['x-forwarded-host'];
   delete out.origin;
   delete out.referer;
@@ -42,17 +90,18 @@ function rewriteHeaders(headers) {
   delete out['sec-fetch-mode'];
   delete out['sec-fetch-dest'];
   delete out['sec-fetch-user'];
+  delete out['content-length']; // 让 node 重新计算
+  if (withCookie && cookieHeader) out.cookie = cookieHeader;
   return out;
 }
 
-// 文件名清洗：只保留 basename，拒绝路径穿越
+// ------------------------------------------------------------------ 文件桥
 function safeName(name) {
   const base = path.basename(String(name ?? 'file'));
   if (!base || base === '.' || base === '..') throw new Error('invalid filename');
   return base;
 }
 
-// 把请求的路径解析到 FILE_ROOT 内（绝对路径或相对路径均可），越界即拒绝
 function resolveWithinRoot(requested) {
   const abs = path.isAbsolute(requested) ? path.normalize(requested) : path.resolve(FILE_ROOT, requested);
   const root = path.resolve(FILE_ROOT);
@@ -60,7 +109,6 @@ function resolveWithinRoot(requested) {
   return abs;
 }
 
-// 文件桥路由；返回 true 表示已处理（含错误响应），false 表示交给 DSH 代理
 async function handleFiles(req, res) {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'POST' && url.pathname === '/files') {
@@ -98,39 +146,69 @@ async function handleFiles(req, res) {
     }
     return true;
   }
+  if (req.method === 'GET' && url.pathname === '/healthz') {
+    const body = JSON.stringify({ ok: Boolean(authority && cookieHeader), upstream: authority ?? null, fileRoot: FILE_ROOT });
+    res.writeHead(authority && cookieHeader ? 200 : 503, { 'content-type': 'application/json' });
+    res.end(body);
+    return true;
+  }
   return false;
+}
+
+// ------------------------------------------------------------------ 代理
+async function ensureUpstream() {
+  if (authority && cookieHeader) return true;
+  const found = await discoverUpstream();
+  if (found) log(`upstream ready: ${found}（已签发会话 cookie）`);
+  else log('upstream NOT found（等 DSH 起来后自动重试）');
+  return Boolean(found);
 }
 
 const server = createServer(async (req, res) => {
   if (await handleFiles(req, res)) return;
+  if (!(await ensureUpstream())) { res.writeHead(503); res.end('dsh upstream not available'); return; }
   log(req.method, req.url, '<-', req.socket.remoteAddress);
-  const proxy = httpRequest(
-    {
-      host: UPSTREAM_HOST,
-      port: UPSTREAM_PORT,
-      path: req.url,
-      method: req.method,
-      headers: rewriteHeaders(req.headers),
-    },
-    (upRes) => {
-      res.writeHead(upRes.statusCode ?? 502, upRes.headers);
-      upRes.pipe(res);
-    },
-  );
-  proxy.on('error', () => { res.writeHead(502); res.end('bad gateway'); });
-  req.pipe(proxy);
+
+  const pipe = () => {
+    const proxy = httpRequest(
+      { host: UPSTREAM_HOST, port: upstreamPort, path: req.url, method: req.method, headers: upstreamHeaders(req.headers) },
+      (upRes) => {
+        // cookie 过期/密钥轮换：重新签发一次再重试
+        if (upRes.statusCode === 401) {
+          upRes.resume();
+          log('401 from upstream — re-minting cookie and retrying');
+          try { refreshCookie(); } catch (e) { log('re-mint failed:', e.message); }
+          res.writeHead(401, { 'content-type': 'text/plain' });
+          res.end('dsh authentication failed');
+          return;
+        }
+        res.writeHead(upRes.statusCode ?? 502, upRes.headers);
+        upRes.pipe(res);
+      },
+    );
+    proxy.on('error', () => { res.writeHead(502); res.end('bad gateway'); });
+    req.pipe(proxy);
+  };
+  pipe();
 });
 
-server.on('upgrade', (req, socket, head) => {
+server.on('upgrade', async (req, socket, head) => {
+  if (!(await ensureUpstream())) { socket.destroy(); return; }
   log('UPGRADE', req.url, '<-', socket.remoteAddress);
   const proxy = httpRequest({
     host: UPSTREAM_HOST,
-    port: UPSTREAM_PORT,
+    port: upstreamPort,
     path: req.url,
     method: req.method,
-    headers: rewriteHeaders(req.headers),
+    headers: upstreamHeaders(req.headers),
   });
   proxy.on('upgrade', (upRes, upSocket, upHead) => {
+    if (upRes.statusCode !== 101) {
+      log('upgrade rejected by upstream:', upRes.statusCode);
+      socket.destroy();
+      upSocket.destroy();
+      return;
+    }
     const hdrs = Object.entries(upRes.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n');
     socket.write(`HTTP/1.1 101 Switching Protocols\r\n${hdrs}\r\n\r\n`);
     if (upHead && upHead.length) upSocket.unshift(upHead);
@@ -146,6 +224,8 @@ server.on('upgrade', (req, socket, head) => {
 
 server.on('error', (e) => { console.error('forwarder error:', e.message); process.exit(1); });
 
-server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  log(`listening on ${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM_AUTHORITY} (file root: ${FILE_ROOT})`);
+server.listen(LISTEN_PORT, LISTEN_HOST, async () => {
+  log(`listening on ${LISTEN_HOST}:${LISTEN_PORT} (file root: ${FILE_ROOT})`);
+  await ensureUpstream();
+  if (authority) log(`-> upstream ${authority}`);
 });
