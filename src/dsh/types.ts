@@ -43,6 +43,29 @@ export interface SessionSummary {
 export interface SessionListValue {
   items: SessionSummary[];
 }
+// ---- DSH 0.2.0 ----
+/** session/page 的返回：records 与旧 session.history 的事件记录同构 */
+export interface SessionPageValue {
+  records: { type: 'event'; event: SessionEvent }[];
+  hasMore: boolean;
+}
+/** session/modelCatalog 的返回（进程级模型目录；default 取代旧版的 current） */
+export interface ModelCatalogValue {
+  default: ModelSelection;
+  routableProviders: string[];
+  groups: ModelProviderGroup[];
+}
+/** workspace/follow 的流条目：baseline 给全量，其余为增量 */
+export type WorkspaceStreamItem =
+  | {
+      type: 'baseline';
+      value: { items: (WorkspaceView & { archivedSessionIds?: string[]; pinnedSessionIds?: string[] })[] };
+    }
+  | { type: 'upsert'; workspaceId: string; path: string; title: string; sessionIds: string[]; createdAt: string; updatedAt: string }
+  | { type: 'remove'; workspaceId: string }
+  | { type: 'order'; workspaceIds: string[] }
+  | { type: 'archived'; archivedSessionIds: string[] }
+  | { type: 'pinned'; pinnedSessionIds: string[] };
 export interface SessionCreateValue {
   sessionId: string;
   agentPreset?: string;

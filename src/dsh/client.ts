@@ -3,27 +3,17 @@
 
 import {
   AgentPresetListValue,
-  ApprovalResponsePayload,
   ClientRequest,
-  ClientResponse,
-  HostDescription,
-  HostFrame,
+  ModelCatalogValue,
   ModelSelection,
-  MuxFrame,
-  QuestionResponsePayload,
-  RespondReceipt,
-  RespondResult,
   RpcResult,
-  ServerRequest,
   ServerResponse,
   SessionAttachmentValue,
   SessionCreateValue,
-  SessionHistoryValue,
   SessionListValue,
-  SessionModelsValue,
+  SessionPageValue,
   SessionPromptRequest,
   SessionPromptValue,
-  WorkspaceListValue,
   WorkspaceView,
 } from './types';
 
@@ -50,23 +40,26 @@ export class DshClient {
     return this.baseUrl.replace(/^http/, 'ws');
   }
 
-  // 单工 RPC：POST /api/<method>，四象限信封 client-request / server-response
-  async callUnary<T>(method: string, payload: unknown = {}): Promise<RpcResult<T>> {
+  // 单工 RPC：POST /api/<namespace>/<method>，四象限信封 client-request / server-response
+  // DSH 0.2.0：endpoint 是 `<namespace>/<method>`（斜杠，不再是 `session.history` 这种点号），
+  // 且 payload 必须是恰好一个字段 { args: { <具名参数> } }（dsh-api-gateway 的
+  // remoteRequest 校验：恰好一个 plain-object 字段且名为 args）。
+  async callUnary<T>(endpoint: string, args: Record<string, unknown> = {}): Promise<RpcResult<T>> {
     const rpcId = uuid();
-    const message: ClientRequest = { type: 'client-request', rpcId, method, payload };
+    const message: ClientRequest = { type: 'client-request', rpcId, method: endpoint, payload: { args } };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const res = await fetch(`${this.baseUrl}/api/${method}`, {
+      const res = await fetch(`${this.baseUrl}/api/${endpoint}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(message),
         signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${method}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${endpoint}`);
       const full = (await res.json()) as ServerResponse;
       if (full.type !== 'server-response' || full.rpcId !== rpcId) {
-        throw new Error(`bad envelope for ${method}`);
+        throw new Error(`bad envelope for ${endpoint}`);
       }
       return full.result as RpcResult<T>;
     } finally {
@@ -74,129 +67,84 @@ export class DshClient {
     }
   }
 
-  // 打开一条下行 WS（events.mux / events.host），自动重连。返回关闭函数。
-  // onFrame 额外携带 envelope 的 rpcId（审批等可应答帧需要用它回 respond）。
-  openStream(
-    path: 'events.mux' | 'events.host',
-    onFrame: (payload: MuxFrame | HostFrame, rpcId: string) => void,
-    onState?: (open: boolean) => void,
-  ): () => void {
-    let closed = false;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // 说明：0.1.x 的 openStream('events.mux') / POST /api/respond 在 0.2.0 已不存在。
+  // 实时通道与审批应答分别由 ./live.ts（remote.mux 逻辑流）和下面的 answerEvent 负责。
 
-    const connect = () => {
-      if (closed) return;
-      ws = new WebSocket(`${this.wsBase()}/api/${path}`);
-      ws.onopen = () => onState?.(true);
-      ws.onmessage = (e: any) => {
-        if (typeof e.data !== 'string') return; // 忽略二进制帧
-        try {
-          const full = JSON.parse(e.data) as ServerRequest;
-          if (full.type === 'server-request') onFrame(full.payload as MuxFrame | HostFrame, full.rpcId);
-        } catch {
-          /* 忽略坏帧 */
-        }
-      };
-      ws.onclose = () => {
-        onState?.(false);
-        if (!closed) reconnectTimer = setTimeout(connect, 1000);
-      };
-      ws.onerror = () => {
-        try { ws?.close(); } catch {}
-      };
-    };
-
-    connect();
-    return () => {
-      closed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      try { ws?.close(); } catch {}
-    };
-  }
-
-  // 应答 server-request 帧（POST /api/respond）——审批与 AI 提问共用同一通道
-  private async postRespond(rpcId: string, result: RespondResult): Promise<RespondReceipt> {
-    const message: ClientResponse = { type: 'client-response', rpcId, result };
-    const res = await fetch(`${this.baseUrl}/api/respond`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(message),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status} for respond`);
-    return (await res.json()) as RespondReceipt;
-  }
-
-  // 应答审批帧
-  async respond(rpcId: string, value: ApprovalResponsePayload): Promise<RespondReceipt> {
-    return this.postRespond(rpcId, { ok: true, value });
-  }
-
-  // 回答 AI 提问（ask_user_question）：value 形如 { sessionId, answer: { answers: [...] } }
-  async answerQuestion(rpcId: string, value: QuestionResponsePayload): Promise<RespondReceipt> {
-    return this.postRespond(rpcId, { ok: true, value });
-  }
-
-  // 取消 AI 提问（宿主把该次工具调用判为 cancelled）
-  async cancelQuestion(rpcId: string): Promise<RespondReceipt> {
-    return this.postRespond(rpcId, {
-      ok: false,
-      error: { code: 'cancelled', message: 'the user closed this question request', details: {} },
-    });
-  }
-
-  // ---- 高层 API ----
-  describe() {
-    return this.callUnary<HostDescription>('host.describe', {});
-  }
+  // ---- 高层 API（DSH 0.2.0：endpoint 为 `<namespace>/<method>`）----
+  // 0.2.0 没有 host 命名空间；连接状态改由 App 用 session/list + llm/listProviders 组合
   listSessions() {
-    return this.callUnary<SessionListValue>('session.list', {});
-  }
-  listWorkspaces() {
-    return this.callUnary<WorkspaceListValue>('workspace.list', {});
+    return this.callUnary<SessionListValue>('session/list', { _request: {} });
   }
   createSession(payload: { workspaceId?: string; agentPreset?: string; cwd?: string } = {}) {
-    return this.callUnary<SessionCreateValue>('session.create', payload);
+    return this.callUnary<SessionCreateValue>('session/create', { request: payload });
   }
   prompt(req: SessionPromptRequest) {
-    return this.callUnary<SessionPromptValue>('session.prompt', req);
+    // requestId 是 0.2.0 新增的必填字段
+    return this.callUnary<SessionPromptValue>('session/prompt', { request: { requestId: uuid(), ...req } });
   }
-  history(sessionId: string, opts: { beforeSeq?: number; maxMessages?: number } = {}) {
-    // compact: true 让主机只返回消息/工具等表层事件，跳过逐 token 的 assistant/chunk，历史页从 MB 级降到 KB 级
-    return this.callUnary<SessionHistoryValue>('session.history', { sessionId, compact: true, ...opts });
+  /**
+   * 会话历史一页。0.2.0 用 `session/page`：
+   *   request = { address:{kind:'session',sessionId}, throughSeq, beforeSeq?, maxMessages?, turnWindow? }
+   *   value   = { records:[{type:'event', event:{type,seq,time,data}}], hasMore? }
+   * throughSeq 是「看到哪个序号为止」，首次取本会话 projections.asOfSeq，翻页时沿用同一个值。
+   */
+  page(sessionId: string, opts: { throughSeq: number; beforeSeq?: number; maxMessages?: number }) {
+    return this.callUnary<SessionPageValue>('session/page', {
+      request: { address: { kind: 'session', sessionId }, ...opts },
+    });
   }
   cancel(sessionId: string) {
-    return this.callUnary<{ accepted: true }>('session.cancel', { sessionId });
+    return this.callUnary<{ accepted: true }>('session/cancel', { request: { sessionId } });
+  }
+  sessionProjections(sessionId: string) {
+    return this.callUnary<{ asOfSeq: number; values: Record<string, unknown> }>('session/projections', { request: { sessionId } });
   }
   getAttachment(sessionId: string, attachmentId: string) {
-    return this.callUnary<SessionAttachmentValue>('session.attachment', { sessionId, attachmentId });
+    return this.callUnary<SessionAttachmentValue>('session/attachment', { request: { sessionId, attachmentId } });
   }
   renameSession(sessionId: string, title: string) {
-    return this.callUnary<{ title: string; seq: number }>('session.rename', { sessionId, title });
+    return this.callUnary<{ title: string; seq: number }>('session/rename', { request: { sessionId, title } });
   }
   listAgentPresets() {
-    return this.callUnary<AgentPresetListValue>('agentPreset.list', {});
+    return this.callUnary<AgentPresetListValue>('agentPresets/list', {});
   }
-  selectAgentPreset(sessionId: string, agentPreset: string) {
-    return this.callUnary<{ agentPreset: string }>('agentPreset.select', { sessionId, agentPreset });
+  selectAgentPreset(agentId: string, agentPreset: string) {
+    return this.callUnary<{ agentPreset: string }>('agentPresets/select', { agentId, agentPreset });
   }
-  getSessionModels(sessionId: string) {
-    return this.callUnary<SessionModelsValue>('session.models', { sessionId });
+  // 0.2.0 的模型目录是进程级（不针对单个会话），返回 { default, routableProviders, groups }
+  getModelCatalog() {
+    return this.callUnary<ModelCatalogValue>('session/modelCatalog', {});
   }
-  selectModel(sessionId: string, provider: string, model: string) {
-    return this.callUnary<{ selected: ModelSelection }>('session.selectModel', { sessionId, provider, model });
+  selectModel(sessionId: string, provider: string, model: string, reasoningEffort?: string) {
+    return this.callUnary<{ selected: ModelSelection }>('session/selectModel', {
+      request: { sessionId, provider, model, ...(reasoningEffort ? { reasoningEffort } : {}) },
+    });
   }
   // 归档会话（DSH 无真正删除，归档即隐藏）
   archiveSession(sessionId: string) {
-    return this.callUnary<{ archivedSessionIds: string[] }>('workspace.archiveSession', { sessionId });
+    return this.callUnary<{ archivedSessionIds: string[] }>('workspace/archiveSession', { request: { sessionId } });
   }
   createWorkspace(path: string) {
-    return this.callUnary<{ workspace: WorkspaceView; created: boolean }>('workspace.create', { path });
+    return this.callUnary<{ workspace: WorkspaceView; created: boolean }>('workspace/create', { request: { path } });
   }
   renameWorkspace(workspaceId: string, title: string) {
-    return this.callUnary<{ workspace: WorkspaceView }>('workspace.rename', { workspaceId, title });
+    return this.callUnary<{ workspace: WorkspaceView }>('workspace/rename', { request: { workspaceId, title } });
   }
   deleteWorkspace(workspaceId: string) {
-    return this.callUnary<{ deleted: true }>('workspace.delete', { workspaceId });
+    return this.callUnary<{ deleted: true }>('workspace/delete', { request: { workspaceId } });
+  }
+  /**
+   * 应答一个「转发事件」（审批 approval/request、AI 提问 user-questions/request）。
+   * 0.2.0 把它做成一元 endpoint：POST /api/$events/result，
+   * args = { clientId, eventId, outcome:{ kind:'result', value } | { kind:'rejected', error } }。
+   * 审批的 value 是结果词表里的字符串（'allowed-once' | 'rejected' | …）；
+   * AI 提问的 value 是 { answers:[{ id, selected, custom? }] }。
+   */
+  answerEvent(
+    clientId: string,
+    eventId: string,
+    outcome: { kind: 'result'; value?: unknown } | { kind: 'rejected'; error?: unknown },
+  ) {
+    return this.callUnary<{ accepted?: true }>('$events/result', { clientId, eventId, outcome });
   }
 }

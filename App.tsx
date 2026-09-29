@@ -23,6 +23,7 @@ import { pick, keepLocalCopy, types, isErrorWithCode, errorCodes } from '@react-
 import { CachesDirectoryPath, readFile as fsReadFile, writeFile as fsWriteFile } from '@dr.pogodin/react-native-fs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DshClient } from './src/dsh/client';
+import { DshLive } from './src/dsh/live';
 import {
   buildQuestionAnswers,
   questionAnswered,
@@ -36,8 +37,7 @@ import type {
   AgentPresetEntry,
   AskUserQuestion,
   HistoryEntry,
-  HostFrame,
-  MuxFrame,
+  SessionEvent,
   SessionModelsValue,
   SessionSummary,
   WorkspaceView,
@@ -57,18 +57,30 @@ export type ChatItem =
   | { kind: 'tool'; id: string; name: string; args: string; result?: string; isError?: boolean; done: boolean };
 
 interface PendingApproval {
-  rpcId: string;
+  clientId: string;
+  eventId: string;
   sessionId: string;
   approvalId: string;
   toolName: string;
   reason?: string;
 }
 
-/** AI 提问（ask_user_question）：宿主的 server-request 帧 + 本地的作答草稿 */
+/** AI 提问（ask_user_question）：宿主通过 $events 的 user-questions/request 下发 */
 interface PendingQuestion {
-  rpcId: string;
+  clientId: string;
+  eventId: string;
   sessionId: string;
   questions: AskUserQuestion[];
+}
+
+/** 0.2.0 的会话地址：普通会话 / 子代理会话 */
+export function sessionAddress(s: SessionSummary): { kind: 'session'; sessionId: string } | { kind: 'subagent'; parentSessionId: string; childSessionId: string; mode: string } {
+  const anyS = s as any;
+  if (anyS.origin === 'subagent' && anyS.parentSessionId) {
+    const mode = anyS.mode === 'one-shot' || anyS.mode === 'continuable' ? anyS.mode : 'continuable';
+    return { kind: 'subagent', parentSessionId: anyS.parentSessionId, childSessionId: s.sessionId, mode };
+  }
+  return { kind: 'session', sessionId: s.sessionId };
 }
 
 // 单条工具参数/结果最多渲染的字符数。
@@ -170,15 +182,28 @@ function minEventSeq(events: HistoryEntry[]): number | undefined {
   return min === Infinity ? undefined : min;
 }
 
-async function loadHistory(client: DshClient, sessionId: string): Promise<{ items: ChatItem[]; tokenUsage: any | null; hasMore: boolean; oldestSeq: number | undefined; error?: string }> {
-  const r = await client.history(sessionId);
+/**
+ * 打开会话：先取当前序号（throughSeq）与投影，再取一页历史。
+ * DSH 0.2.0 把 `session.history` 换成了 `session/page`：
+ *   请求 { address:{kind:'session',sessionId}, throughSeq, beforeSeq?, maxMessages? }
+ *   返回 { records:[{type:'event', event:{type,seq,time,data}}], hasMore }
+ * records 里的事件与旧版 history 同构，因此解析器不用改。
+ */
+async function loadHistory(
+  client: DshClient,
+  sessionId: string,
+): Promise<{ items: ChatItem[]; tokenUsage: any | null; hasMore: boolean; oldestSeq: number | undefined; throughSeq: number; error?: string }> {
+  const proj = await client.sessionProjections(sessionId);
+  const throughSeq = proj.ok ? proj.value.asOfSeq : 0;
+  const r = await client.page(sessionId, { throughSeq });
   if (!r.ok) {
-    const msg = r.error?.code === 'session-not-found' ? '会话不存在' : `加载失败(${r.error?.code ?? 'unknown'})`;
-    return { items: [], tokenUsage: null, hasMore: false, oldestSeq: undefined, error: r.error?.message ?? msg };
+    const msg = r.error?.code?.includes('not-found') ? '会话不存在' : `加载失败(${r.error?.code ?? 'unknown'})`;
+    return { items: [], tokenUsage: null, hasMore: false, oldestSeq: undefined, throughSeq, error: r.error?.message ?? msg };
   }
-  const items = parseHistoryEvents(r.value.events);
-  const tokenUsage = (r.value as any)?.projections?.values?.tokenUsage ?? null;
-  return { items, tokenUsage, hasMore: r.value.hasMore, oldestSeq: minEventSeq(r.value.events) };
+  const events = r.value.records.map((rec: { event: SessionEvent }) => ({ event: rec.event }));
+  const items = parseHistoryEvents(events);
+  const tokenUsage = proj.ok ? ((proj.value.values as any)?.tokenUsage ?? null) : null;
+  return { items, tokenUsage, hasMore: r.value.hasMore, oldestSeq: minEventSeq(events), throughSeq };
 }
 
 function sessionTitle(s: SessionSummary): string {
@@ -401,7 +426,11 @@ export default function App() {
   const clientRef = useRef<DshClient | null>(null);
   const sessionRef = useRef<string | null>(null);
   const streamRef = useRef<{ id: string } | null>(null);
-  const stopRef = useRef<(() => void) | null>(null);
+  // DSH 0.2.0 的实时通道（remote.mux + $events/control/workspace/session 四条流）
+  const liveRef = useRef<DshLive | null>(null);
+  const liveClientIdRef = useRef<string | null>(null);
+  // 刷新列表（供 live 回调里调用，避免定义顺序依赖）
+  const refreshListsRef = useRef<(() => Promise<void>) | null>(null);
   const listRef = useRef<FlatList<ChatItem>>(null);
   // 反转列表下「是否停在最新一条」，仅用于展示/后续扩展；滚动定位不再依赖它
   const isAtBottomRef = useRef(true);
@@ -409,13 +438,46 @@ export default function App() {
   // 历史分页游标
   const historyHasMoreRef = useRef(false);
   const historyOldestSeqRef = useRef<number | undefined>(undefined);
+  // session/page 需要固定一个 throughSeq（「看到哪个序号为止」），翻页时必须沿用
+  const throughSeqRef = useRef(0);
   const loadingOlderRef = useRef(false);
+  // 最新的会话/工作区列表（供 useCallback 内部读取，避免把 state 塞进依赖）
+  const sessionsRef = useRef<SessionSummary[]>([]);
+  const workspacesRef = useRef<WorkspaceView[]>([]);
   // 已加载条数（给 loadOlder 的上限判断用，避免把 items 塞进 useCallback 依赖）
   const itemsCountRef = useRef(0);
+
+  /**
+   * 把 session/control 的 projections 合并进会话列表（标题、token 用量等），
+   * 并同步当前会话的 token 用量。
+   */
+  const applyProjections = useCallback((projections: Record<string, { asOfSeq?: number; values?: Record<string, any> }>) => {
+    setSessions((prev) =>
+      prev.map((s) => {
+        const p = projections[s.sessionId];
+        if (!p?.values) return s;
+        const old = (s as any).projections ?? {};
+        return {
+          ...s,
+          projections: { ...old, asOfSeq: p.asOfSeq ?? old.asOfSeq, values: { ...(old.values ?? {}), ...p.values } },
+        } as SessionSummary;
+      }),
+    );
+    const activeId = sessionRef.current;
+    if (activeId && projections[activeId]?.values?.tokenUsage) setTokenUsage(projections[activeId].values.tokenUsage);
+  }, []);
 
   useEffect(() => {
     itemsCountRef.current = items.length;
   }, [items]);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  useEffect(() => {
+    workspacesRef.current = workspaces;
+  }, [workspaces]);
 
   // 载入持久化设置
   useEffect(() => {
@@ -461,44 +523,35 @@ export default function App() {
     setTokenUsage(null);
     setStatus('连接中…');
 
-    const handleFrame = (payload: MuxFrame | HostFrame, rpcId: string) => {
-      const p = payload as any;
-      if (p.type === 'approval/requested') {
-        setPendingApproval({
-          rpcId,
-          sessionId: p.sessionId,
-          approvalId: p.approvalId,
-          toolName: p.toolName,
-          reason: p.reason,
-        });
+    // session/follow 的条目形态（0.2.0）：
+    //   {type:'snapshot', header}                                  → 会话快照
+    //   {type:'event', event:{type,seq,time,data}}                 → 会话事件（与历史页同构）
+    //   {type:'assistant-stream', frame:{type:'chunk', chunk:{…}}}  → 助手增量（块类型与旧版一致）
+    const handleSessionItem = (item: any) => {
+      if (!item || typeof item !== 'object') return;
+      if (item.type === 'assistant-stream') {
+        const chunk = item.frame?.chunk;
+        if (!chunk) return;
+        const ensureStream = () => {
+          if (!streamRef.current) {
+            const id = `a-${item.frame?.revision ?? Date.now()}`;
+            streamRef.current = { id };
+            setItems((prev) => [...prev, { kind: 'msg', id, role: 'assistant', text: '', reasoning: '', streaming: true }]);
+          }
+          return streamRef.current.id;
+        };
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+          const sid = ensureStream();
+          setItems((prev) => prev.map((m) => (m.kind === 'msg' && m.id === sid ? { ...m, text: m.text + chunk.text } : m)));
+        } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+          const sid = ensureStream();
+          setItems((prev) => prev.map((m) => (m.kind === 'msg' && m.id === sid ? { ...m, reasoning: (m.reasoning ?? '') + chunk.text } : m)));
+        }
         return;
       }
-      if (p.type === 'approval/resolved') {
-        setPendingApproval((cur) => (cur && cur.approvalId === p.approvalId ? null : cur));
-        return;
-      }
-      if (p.type === 'question/requested') {
-        // AI 提问：模型调用 ask_user_question 时阻塞等待，这里弹窗收集答案
-        const questions: AskUserQuestion[] = Array.isArray(p.questions) ? p.questions : [];
-        if (questions.length === 0) return;
-        setPendingQuestion({ rpcId, sessionId: p.sessionId, questions });
-        setQuestionDrafts(
-          Object.fromEntries(questions.map((q) => [q.id, { selected: [], custom: '' } as QuestionDraft])),
-        );
-        setQuestionBusy(false);
-        return;
-      }
-      if (p.type === 'question/resolved') {
-        setPendingQuestion((cur) => (cur && cur.rpcId === p.questionRpcId ? null : cur));
-        return;
-      }
-      if (p.type === 'session/projection' && p.sessionId === sessionRef.current && p.key === 'tokenUsage') {
-        setTokenUsage(p.value);
-        return;
-      }
-      if (p.type !== 'session/event') return;
-      const ev = p.event;
-      if (!ev || p.sessionId !== sessionRef.current) return;
+      if (item.type !== 'event') return;
+      const ev = item.event;
+      if (!ev) return;
 
       if (ev.type === 'assistant/chunk') {
         const chunk = ev.data?.chunk;
@@ -546,27 +599,116 @@ export default function App() {
       }
     };
 
+    // ---------------- DSH 0.2.0 实时通道 ----------------
+    // 四条逻辑流：
+    //   $events（DshLive 内部订阅）→ 审批 approval/request、AI 提问 user-questions/request、
+    //                               会话增删/状态 api-session/*
+    //   session/control            → 各会话 projections（标题、token 用量…）
+    //   workspace/follow           → 工作区列表（baseline + 增量）
+    //   session/follow             → 当前会话的事件记录 + 助手增量帧
+    const live = new DshLive(appliedUrl, {
+      onState: (open) => setStatus((s) => (open ? '已连接' : s.startsWith('连接失败') ? s : '连接中…')),
+      onReady: (info) => { liveClientIdRef.current = info.clientId; },
+      onEvent: (frame) => {
+        // waterfall 的载荷在 frame.request，emit 的载荷在 args[0]
+        const p: any = (frame as any).request ?? frame.args?.[0] ?? {};
+        if (frame.event === 'approval/request') {
+          setPendingApproval({
+            clientId: frame.clientId,
+            eventId: frame.eventId,
+            sessionId: p.sessionId ?? p.agent?.sessionId ?? sessionRef.current ?? '',
+            approvalId: p.approvalId ?? p.callId ?? '',
+            toolName: p.toolName ?? p.tool ?? '工具',
+            reason: p.reason ?? p.displayReason,
+          });
+          return;
+        }
+        if (frame.event === 'user-questions/request') {
+          const questions: AskUserQuestion[] = Array.isArray(p.questions) ? p.questions : [];
+          if (questions.length === 0) return;
+          setPendingQuestion({
+            clientId: frame.clientId,
+            eventId: frame.eventId,
+            sessionId: p.sessionId ?? sessionRef.current ?? '',
+            questions,
+          });
+          setQuestionDrafts(Object.fromEntries(questions.map((q) => [q.id, { selected: [], custom: '' } as QuestionDraft])));
+          setQuestionBusy(false);
+          return;
+        }
+        if (frame.event === 'api-session/added' || frame.event === 'api-session/removed') {
+          void refreshListsRef.current?.();
+          return;
+        }
+        if (frame.event === 'api-session/status' || frame.event === 'api-session/activity') {
+          const [sid, value] = frame.args as [string, any];
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.sessionId === sid
+                ? { ...s, running: frame.event === 'api-session/status' ? Boolean(value) : s.running, updatedAt: frame.event === 'api-session/activity' ? Number(value) : s.updatedAt }
+                : s,
+            ),
+          );
+        }
+      },
+      onControl: (item) => {
+        if (!item || typeof item !== 'object') return;
+        if (item.type === 'baseline') {
+          const projections = item.value?.projections ?? {};
+          applyProjections(projections);
+          return;
+        }
+        if (item.type === 'projection' && item.sessionId) {
+          applyProjections({ [item.sessionId]: { asOfSeq: item.seq, values: { [item.key]: item.value } } });
+        }
+      },
+      onWorkspace: (item) => {
+        if (!item || typeof item !== 'object') return;
+        if (item.type === 'baseline') {
+          const items = item.value?.items ?? [];
+          setWorkspaces(items);
+          setArchivedSessionIds(items.flatMap((w: any) => w.archivedSessionIds ?? []));
+          return;
+        }
+        if (item.type === 'upsert') {
+          setWorkspaces((prev) => {
+            const next = prev.filter((w) => w.workspaceId !== item.workspaceId);
+            next.push({ workspaceId: item.workspaceId, path: item.path, title: item.title, sessionIds: item.sessionIds, createdAt: item.createdAt, updatedAt: item.updatedAt });
+            return next;
+          });
+          return;
+        }
+        if (item.type === 'remove') { setWorkspaces((prev) => prev.filter((w) => w.workspaceId !== item.workspaceId)); return; }
+        if (item.type === 'order') {
+          setWorkspaces((prev) => {
+            const byId = new Map(prev.map((w) => [w.workspaceId, w]));
+            const ordered = item.workspaceIds.map((id: string) => byId.get(id)).filter(Boolean) as WorkspaceView[];
+            for (const w of prev) if (!item.workspaceIds.includes(w.workspaceId)) ordered.push(w);
+            return ordered;
+          });
+          return;
+        }
+        if (item.type === 'archived') { setArchivedSessionIds(item.archivedSessionIds ?? []); }
+      },
+      onSession: (item) => handleSessionItem(item),
+      onStreamError: (endpoint, error) => {
+        if (endpoint === 'session/follow') setStatus(`会话流中断：${error.code}`);
+      },
+    });
+    liveRef.current = live;
+
     (async () => {
-      const d = await client.describe();
+      const [s, pr, mc] = await Promise.all([client.listSessions(), client.listAgentPresets(), client.getModelCatalog()]);
       if (!mounted) return;
-      if (d.ok) {
-        setHostLine(`${d.value.model ?? ''} @ ${d.value.cwd}`);
-        setStatus('已连接');
-      } else {
-        setStatus('连接失败: ' + d.error.code);
-        return;
-      }
-      const [w, s, pr] = await Promise.all([
-        client.listWorkspaces(),
-        client.listSessions(),
-        client.listAgentPresets(),
-      ]);
-      if (!mounted) return;
-      if (w.ok) { setWorkspaces(w.value.items); setArchivedSessionIds(w.value.archivedSessionIds); }
-      if (s.ok) setSessions(s.value.items);
+      if (s.ok) { setSessions(s.value.items); setStatus('已连接'); }
+      else setStatus('连接失败: ' + s.error.code);
       if (pr.ok) {
         setPresets(pr.value.presets);
         setSelectedPreset((old) => old ?? pr.value.presets.find((x) => x.id === 'minimal-bash')?.id ?? pr.value.presets.find((x) => x.id === 'minimal')?.id ?? pr.value.presets.find((x) => x.isDefault)?.id ?? null);
+      }
+      if (mc.ok) {
+        setModels({ current: mc.value.default, routable: mc.value.routableProviders.length > 0, groups: mc.value.groups, failures: [] });
+        setHostLine(`${mc.value.default.provider} · ${mc.value.default.model}`);
       }
       const list = s.ok ? s.value.items : [];
       const restore = restoreSessionRef.current;
@@ -575,24 +717,27 @@ export default function App() {
       if (target) {
         sessionRef.current = target.sessionId;
         setActiveSessionId(target.sessionId);
+        live.followSession(sessionAddress(target));
         const res = await loadHistory(client, target.sessionId);
         isAtBottomRef.current = true;
         setItems(res.items);
         historyHasMoreRef.current = res.hasMore;
         historyOldestSeqRef.current = res.oldestSeq;
+        throughSeqRef.current = res.throughSeq;
         if (res.tokenUsage) setTokenUsage(res.tokenUsage);
       }
     })();
 
-    stopRef.current = client.openStream('events.mux', handleFrame, (open) => {
-      if (open) setStatus((s) => (s.startsWith('连接失败') ? s : '已连接'));
-    });
+    live.connect();
+    live.subscribe('control', 'session/control', {});
+    live.subscribe('workspace', 'workspace/follow', {});
 
     return () => {
       mounted = false;
-      stopRef.current?.();
+      live.close();
+      liveRef.current = null;
     };
-  }, [hydrated, appliedUrl]);
+  }, [hydrated, appliedUrl, applyProjections]);
 
   const visibleSessions = useCallback(() => {
     let list = sessions;
@@ -607,10 +752,14 @@ export default function App() {
   const refreshLists = useCallback(async () => {
     const c = clientRef.current;
     if (!c) return;
-    const [w, s] = await Promise.all([c.listWorkspaces(), c.listSessions()]);
-    if (w.ok) { setWorkspaces(w.value.items); setArchivedSessionIds(w.value.archivedSessionIds); }
+    // 工作区列表由 workspace/follow 流维护，这里只刷新会话列表
+    const s = await c.listSessions();
     if (s.ok) setSessions(s.value.items);
   }, []);
+
+  useEffect(() => {
+    refreshListsRef.current = refreshLists;
+  }, [refreshLists]);
 
   // 滑到「最旧」一端时加载更早的一页历史
   // 反转列表下，更早的消息追加到反转数据的末尾（视觉上方），不会移动当前视口，
@@ -624,10 +773,12 @@ export default function App() {
     loadingOlderRef.current = true;
     setLoadingOlder(true);
     try {
-      const r = await c.history(sid, { beforeSeq: historyOldestSeqRef.current });
+      // 翻页沿用首次取到的 throughSeq（0.2.0 的 page 需要固定同一个「看到哪」的序号）
+      const r = await c.page(sid, { throughSeq: throughSeqRef.current, beforeSeq: historyOldestSeqRef.current });
       if (!r.ok || sessionRef.current !== sid) return;
-      const older = parseHistoryEvents(r.value.events);
-      const nextOldest = minEventSeq(r.value.events);
+      const events = r.value.records.map((rec: { event: SessionEvent }) => ({ event: rec.event }));
+      const older = parseHistoryEvents(events);
+      const nextOldest = minEventSeq(events);
       if (older.length > 0) setItems((prev) => [...older, ...prev]);
       if (nextOldest !== undefined) historyOldestSeqRef.current = nextOldest;
       historyHasMoreRef.current = r.value.hasMore;
@@ -655,13 +806,18 @@ export default function App() {
     setKbHeight(0);
     historyHasMoreRef.current = false;
     historyOldestSeqRef.current = undefined;
+    throughSeqRef.current = 0;
     loadingOlderRef.current = false;
     setHistoryStatus('loading');
     setHistoryError(null);
+    // 跟随该会话：事件记录 + 助手增量都从这里来
+    const s = sessionsRef.current.find((x) => x.sessionId === sid);
+    liveRef.current?.followSession(s ? sessionAddress(s) : { kind: 'session', sessionId: sid });
     const res = await loadHistory(c, sid);
     setItems(res.items);
     historyHasMoreRef.current = res.hasMore;
     historyOldestSeqRef.current = res.oldestSeq;
+    throughSeqRef.current = res.throughSeq;
     if (res.tokenUsage) setTokenUsage(res.tokenUsage);
     if (res.error) {
       setHistoryError(res.error);
@@ -674,8 +830,10 @@ export default function App() {
   const createNewSession = useCallback(async () => {
     const c = clientRef.current;
     if (!c) return;
+    // 0.2.0 的 session/create 用 cwd（工作区路径）而不是 workspaceId
+    const ws = activeWorkspaceId ? workspacesRef.current.find((w) => w.workspaceId === activeWorkspaceId) : undefined;
     const r = await c.createSession({
-      workspaceId: activeWorkspaceId ?? undefined,
+      cwd: ws?.path,
       agentPreset: selectedPreset ?? undefined,
     });
     if (r.ok) {
@@ -686,12 +844,14 @@ export default function App() {
       setReasoningOpen({});
       historyHasMoreRef.current = false;
       historyOldestSeqRef.current = undefined;
+      throughSeqRef.current = 0;
       loadingOlderRef.current = false;
       setHistoryStatus('ready');
       setHistoryError(null);
       setKbHeight(0);
       setBusy(false);
       setSidebarOpen(false);
+      liveRef.current?.followSession({ kind: 'session', sessionId: r.value.sessionId });
       refreshLists();
     } else {
       setStatus('建会话失败: ' + r.error.code);
@@ -734,10 +894,10 @@ export default function App() {
 
   const loadModels = useCallback(async () => {
     const c = clientRef.current;
-    const sid = sessionRef.current;
-    if (!c || !sid) return;
-    const r = await c.getSessionModels(sid);
-    if (r.ok) setModels(r.value);
+    if (!c) return;
+    // 0.2.0 的模型目录是进程级的：session/modelCatalog → { default, routableProviders, groups }
+    const r = await c.getModelCatalog();
+    if (r.ok) setModels({ current: r.value.default, routable: r.value.routableProviders.length > 0, groups: r.value.groups, failures: [] });
   }, []);
 
   const selectModel = useCallback(async (provider: string, model: string) => {
@@ -833,12 +993,13 @@ export default function App() {
     }
   }, [appliedUrl]);
 
+  // 审批应答：0.2.0 通过 $events/result 回复「转发事件」，值是结果词表里的字符串
   const respondApproval = useCallback(async (outcome: 'allowed-once' | 'rejected') => {
     if (!pendingApproval) return;
-    const { rpcId, sessionId, approvalId } = pendingApproval;
+    const { clientId, eventId } = pendingApproval;
     setPendingApproval(null);
     try {
-      await clientRef.current?.respond(rpcId, { sessionId, approvalId, outcome });
+      await clientRef.current?.answerEvent(clientId, eventId, { kind: 'result', value: outcome });
     } catch {
       setStatus('审批应答失败');
     }
@@ -853,15 +1014,15 @@ export default function App() {
     }
     setQuestionBusy(true);
     setQuestionError(null);
-    const { rpcId, sessionId, questions } = pendingQuestion;
+    const { clientId, eventId, questions } = pendingQuestion;
     try {
-      const receipt = await clientRef.current?.answerQuestion(rpcId, {
-        sessionId,
-        answer: { answers: buildQuestionAnswers(questions, questionDrafts) },
+      const r = await clientRef.current?.answerEvent(clientId, eventId, {
+        kind: 'result',
+        value: { answers: buildQuestionAnswers(questions, questionDrafts) },
       });
-      if (receipt && !receipt.accepted) {
+      if (r && !r.ok) {
         setQuestionBusy(false);
-        setQuestionError(`提交被拒绝（${receipt.reason ?? 'unknown'}）`);
+        setQuestionError(`提交被拒绝（${r.error.code}）`);
         return;
       }
       setPendingQuestion(null);
@@ -871,13 +1032,17 @@ export default function App() {
     }
   }, [pendingQuestion, questionDrafts, questionBusy]);
 
-  // 取消 AI 提问（宿主把该次工具调用判为 cancelled）
+  // 取消 AI 提问（以 rejected 结算，宿主把该次工具调用判为 cancelled）
   const cancelQuestion = useCallback(async () => {
     if (!pendingQuestion || questionBusy) return;
     setQuestionBusy(true);
     setQuestionError(null);
+    const { clientId, eventId } = pendingQuestion;
     try {
-      await clientRef.current?.cancelQuestion(pendingQuestion.rpcId);
+      await clientRef.current?.answerEvent(clientId, eventId, {
+        kind: 'rejected',
+        error: { code: 'cancelled', message: 'the user closed this question request', details: {} },
+      });
       setPendingQuestion(null);
     } catch (e: any) {
       setQuestionBusy(false);

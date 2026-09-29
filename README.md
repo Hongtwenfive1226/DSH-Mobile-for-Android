@@ -21,16 +21,23 @@ DeepSeek Harness（DSH）的移动端客户端，基于 React Native（Android�
 
 ```
 手机（RN App）
-   │  HTTP POST /api/*  +  两条纯下行 WebSocket（events.mux / events.host）
+   │  HTTP POST /api/<namespace>/<method>（payload = { args: { … } }）
+   │  + 一条 WebSocket /api/remote.mux（逻辑流：$events / session/control /
+   │    workspace/follow / session/follow）
    ▼
 转发器 poc/forwarder.mjs（监听 Tailscale IP，如 100.x.x.x:8787）
-   │  转发到 127.0.0.1:3080，Host 重写为 loopback 以通过 DSH trust-fence
-   │  └─ 附带文件桥：POST /files 上传、GET /files?path= 下载
+   │  转发到 127.0.0.1:19387（自动探测端口）
+   │  └─ 用 ~/.dsh/.credentials.yaml 里的密钥自行签发浏览器会话 cookie，
+   │     Host 重写为 loopback：同时满足 0.2.0 的 trust-fence 与 cookie audience
+   │  └─ 附带文件桥：POST /files 上传、GET /files?path= 下载、GET /healthz 探活
    ▼
-DSH web（127.0.0.1:3080，桌面端 dsh web）
+DSH 0.2.0-rc.1（官方 Electron 桌面版，127.0.0.1:19387）
 ```
 
-DSH 的 `/api` 是类型化 RPC（HTTP 上行 + 两条纯下行 WebSocket），协议细节见 [`poc/protocol.md`](poc/protocol.md)，公网安全接入方案见 [`poc/P2-public-access.md`](poc/P2-public-access.md)。
+DSH 0.2.0 的 `/api` 是类型化 RPC：endpoint 形如 `<namespace>/<method>`，payload 恰好一个字段
+`args`（具名参数），每个方法与 WebSocket 都需要浏览器会话 cookie。协议细节（含实测记录）见
+[`poc/protocol.md`](poc/protocol.md)、[`docs/api-streams.md`](../../dsh-mobile-poc/docs/api-streams.md)，
+公网安全接入方案见 [`poc/P2-public-access.md`](poc/P2-public-access.md)。
 
 ## 目录结构
 

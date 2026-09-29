@@ -2,6 +2,45 @@
 
 本项目的版本号（`versionCode` / `versionName`）与 APK 的 Android 版本信息一致。所有版本均可通过文件桥或 GitHub Release 下载。
 
+## v1.14（versionCode 15）— 2026-09-29
+
+**适配 DSH 0.2.0-rc.1（官方 Electron 桌面版）：整个协议层换代**
+
+DSH 从 `dsh web`（0.1.x，127.0.0.1:3080，无鉴权）换成了官方桌面版（0.2.0-rc.1，127.0.0.1:19387，
+**所有 /api 与 WebSocket 都要浏览器会话 cookie**），因此 App 与转发器都要改。
+
+**实测确认的 0.2.0 契约**（依据 asar 内 `dsh-api-gateway` / `dsh-api-session-controller` 源码 + 活体探测）：
+
+| 项目 | 0.1.x | 0.2.0 |
+|---|---|---|
+| endpoint | `session.history` | `session/page`（`<namespace>/<method>`，斜杠） |
+| 请求体 | `{sessionId,…}` | `{ args: { <具名参数> } }`（恰好一个名为 args 的 plain-object 字段） |
+| 历史 | `session.history` → `{events}` | `session/page` → `{ records:[{type:'event',event}], hasMore }` |
+| 实时 | WS `/api/events.mux` + `session/event` 帧 | WS `/api/remote.mux` + 逻辑流 `session/follow` |
+| 审批/提问 | WS 的 `approval/requested` 帧 + `POST /api/respond` | `$events` 流的 `approval/request` / `user-questions/request` + `POST /api/$events/result` |
+| 模型 | `session.models` | `session/modelCatalog`（进程级，`default` 取代 `current`） |
+| 预设 | `agentPreset.list/select` | `agentPresets/list` + `agentPresets/select {agentId,agentPreset}` |
+| 工作区 | `workspace.list` | `workspace/follow` 流（baseline + upsert/remove/order/archived/pinned） |
+| 会话地址 | 只接受 sessionId | `{kind:'session'}` 或 `{kind:'subagent',parentSessionId,childSessionId,mode}` |
+
+- ♻️ `src/dsh/client.ts`：一元调用改为 `POST /api/<namespace>/<method>` + `{args}`；历史改
+  `session/page`（先取 `session/projections` 的 `asOfSeq` 作为 `throughSeq`，翻页沿用同一值）；
+  新增 `answerEvent()`（`$events/result`）；移除 0.1.x 的 `openStream`/`respond`。
+- ✨ `src/dsh/live.ts`（新）：`/api/remote.mux` 实时通道，内部维持四条逻辑流并自动重连：
+  `$events`（审批/AI 提问/会话增删）、`session/control`（会话 projections）、
+  `workspace/follow`（工作区）、`session/follow`（当前会话的事件记录 + 助手增量）。
+- ♻️ `App.tsx`：会话列表/标题/token 用量改由 `session/control` 的 projections 驱动；
+  工作区列表改由 `workspace/follow` 驱动；审批与 AI 提问改走 `$events` + `$events/result`
+  （审批值就是 `allowed-once`/`rejected`，提问值是 `{answers:[{id,selected,custom?}]}`）；
+  子代理会话自动使用 subagent 地址；`session/create` 用 `cwd` 而不是 `workspaceId`。
+- 🧪 新增 `__tests__/protocol020.test.ts`（12 项）：endpoint/URL、`{args}` 包装、
+  `session/page` 请求结构、`prompt` 自动补 `requestId`、`answerEvent`、会话地址映射、
+  remote.mux 的 open/item/end/error 分发与 `$events` ready/waterfall 解析。
+- 转发器（`poc/forwarder.mjs`）同步升级：上游端口改为 19387 并自动探测；
+  用本机 `~/.dsh/.credentials.yaml` 里的签名密钥**自行签发浏览器会话 cookie**
+  （0.2.0 的启动令牌是进程内随机值，外部拿不到），Host 重写为 loopback（信任栅栏 + cookie audience 都对得上），
+  HTTP 与 WebSocket 升级都会带上；新增 `/healthz`。手机端地址不变，仍是 `http://<Tailscale IP>:8787`。
+
 ## v1.13（versionCode 14）— 2026-09-20
 
 **「大段空白」的真正根因：虚拟化列表的估算高度 spacer（已定位到 RN 源码）**
