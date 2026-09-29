@@ -57,16 +57,17 @@ presets/minimal-bash/         Git Bash 版极简模式预设（复制到 DSH 预
 
 ### 0. 前置条件
 
-- 桌面端：Node.js ≥ 22、DSH 已安装并配置好模型（`dsh web` 可跑起来）
+- 桌面端：Node.js ≥ 22（仅转发器需要）、**DSH 0.2.0-rc.1 桌面版**已安装并配置好模型
 - Windows 桌面端：已安装 [Git for Windows](https://git-scm.com/download/win)（提供 Git Bash）
 - 桌面与手机都安装 [Tailscale](https://tailscale.com/) 并登录**同一账号**
 - 构建 APK：JDK 17 + Android SDK（推荐 Android Studio）
 
 ### 1. 桌面端运行 DSH
 
-```bash
-dsh web            # 绑定 127.0.0.1:3080
-```
+直接启动 **DeepSeek Harness 桌面版**（0.2.0-rc.1）。它会在 `127.0.0.1` 上随机/固定端口提供
+Web GUI 与 `/api`（当前实测为 **19387**）；转发器会自动探测这个端口，无需手工配置。
+
+> 0.1.x 时代的 `dsh web`（3080）已不再适用：新版每个请求都要浏览器会话 cookie。
 
 ### 2. 创建 Git Bash 版极简模式（可选，但手机端默认会优先选它）
 
@@ -80,22 +81,18 @@ DSH 官方预设（`standard`/`code`/`minimal`/`cordis`）只读，需复制一�
 
 > 这个预设 = 官方 `minimal`（固定人设 + `bash` + `str_replace_editor` 双工具），只是把 shell 换成 Git Bash。手机端 `App.tsx` 里的默认预设选择顺序：`minimal-bash` → `minimal` → 系统默认。
 
-### 3. 开启「对话中更换模式」（必需的主机 patch）
+### 3. 主机端 patch（DSH 0.2.0 起已不再需要源码补丁）
 
-DSH 默认**只允许在空会话（尚未对话）时切换预设**，对话开始后会被 `agent-preset-locked` 拒绝。要让「对话中切换」生效，需要改一处源码（位于 DSH 安装目录，**DSH 更新后会被覆盖，需重打**）。
-
-**一键重打（推荐）**：本项目附带自动化脚本，会用标记检测并重复打上全部所需 patch：
-
-```bash
-node poc/patch-dsh.mjs          # 自动定位 DSH 安装；或 node poc/patch-dsh.mjs <api-proxy lib/index.js>
-```
-
-**打的是什么**：`<DSH 安装目录>/node_modules/@deepseek-ai/dsh-host-apiproxy/lib/index.js`（Windows 常见位置 `%APPDATA%\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-host-apiproxy\lib\index.js`）里两处——
-
-1. `agentPreset.select` 处理器（搜索 `agent-preset-locked` 或 `sessionBlank`）：删掉 `swap` 里 `if (!sessionBlank(agent.session)) return err(...)` 检查，使对话中途也能 `recompose`。
-2. `session.history`（手机端已依赖的优化）：加 `compact` 标志，跳过逐 token 的 `assistant/chunk`，历史页从约 8MB/页降到约 50KB/页。
-
-改完**重启 DSH**。
+- **历史分页**：0.2.0 的 `session/page` 原生就是「按消息分页」的接口，不再返回逐 token 的
+  `assistant/chunk`，所以 0.1.x 时代给 `session.history` 打的 `compact` 补丁**已经不需要了**
+  （`poc/patch-dsh.mjs` 只对 0.1.x 的 npm 安装有效，对 0.2.0 的 Electron 打包版无效）。
+- **鉴权**：0.2.0 的每个 `/api` 与 WebSocket 都要浏览器会话 cookie，而启动令牌是进程内随机值、
+  外部拿不到。转发器改用 `~/.dsh/.credentials.yaml` 里 `client-connection/browser-session`
+  记录的签名密钥**自行签发 cookie**，因此手机侧不需要任何额外配置。
+- **对话中切换模式**：0.2.0 仍然禁止在会话开始后切换预设
+  （宿主报 `agent-preset/locked`）。手机端的「切换模式」按钮此时会显示该错误；
+  如需真正解锁，需要在 DSH 的 profile 补丁层（`$DSH_HOME/profiles/desktop/cordis.patch.yml`）
+  里插一个主机插件改写这个检查（本项目后续提供）。
 
 ### 4. （可选）桌面端也加「切换模式」按钮
 
